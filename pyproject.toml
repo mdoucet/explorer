@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "explorer"
+version = "0.1.0"
+description = "A LangGraph-based agentic framework for autonomous scientific Python development"
+requires-python = ">=3.9"
+dependencies = [
+    "langgraph>=0.2",
+    "langgraph-checkpoint-sqlite",
+    "langchain>=0.3",
+    "langchain-openai>=0.2",
+    "langchain-ollama>=0.2",
+    "click>=8",
+    "python-dotenv>=1",
+    "jax[cpu]",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio",
+    "pytest-timeout",
+]
+
+[project.scripts]
+explorer = "cli:cli"
+
+[tool.pytest.ini_options]
+markers = [
+    "ollama: end-to-end tests requiring a running Ollama instance",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orchestrator", "src/cli.py"]
