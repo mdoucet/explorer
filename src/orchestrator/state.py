@@ -7,7 +7,9 @@ exposed here so that long-running sessions can be interrupted and resumed.
 
 from __future__ import annotations
 
-from typing import TypedDict
+import sqlite3
+from contextlib import contextmanager
+from typing import Iterator, TypedDict
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
@@ -62,4 +64,5 @@ def make_checkpointer(db_path: str = "checkpoints.sqlite") -> SqliteSaver:
     db_path : str
         Path to the SQLite database used for checkpoint persistence.
     """
-    return SqliteSaver.from_conn_string(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    return SqliteSaver(conn)
