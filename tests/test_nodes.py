@@ -246,6 +246,7 @@ class TestVerifier:
         state = _base_state(code_drafts={})
         result = verifier(state)
         assert result["test_logs"] == ["No code drafts to verify."]
+        assert result["iteration_count"] == 1
 
 
 # ---------------------------------------------------------------------------

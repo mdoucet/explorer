@@ -30,7 +30,7 @@ from orchestrator.state import ScientificState, make_checkpointer
 # Load .env file (if present) so env vars are available as CLI defaults
 load_dotenv()
 
-MAX_ITERATIONS = 50
+MAX_ITERATIONS = 0  # 0 = unlimited
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ def _make_should_continue(max_iters: int):
             if phases and current + 1 < len(phases):
                 return "advance_phase"
             return "end"
-        if state.get("iteration_count", 0) >= max_iters:
+        if max_iters > 0 and state.get("iteration_count", 0) >= max_iters:
             return "end"
         return "reflect"
     return _should_continue
@@ -148,7 +148,7 @@ def cli() -> None:
     default=MAX_ITERATIONS,
     show_default=True,
     type=int,
-    help="Maximum plan-code-verify cycles before stopping.",
+    help="Maximum plan-code-verify cycles before stopping (0 = unlimited).",
 )
 @click.option(
     "--provider",
@@ -270,14 +270,44 @@ def run(task: str | None, task_file: str | None, thread_id: str, db: str,
         else:
             click.echo(f"📚 Loaded {len(all_skills)} skill(s), none matched the task.")
 
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 2**31}
 
-    # When resuming, pass None so LangGraph picks up from the checkpoint;
-    # otherwise supply a full initial state for a fresh start.
+    # When resuming, restore the full accumulated state from the
+    # checkpoint and restart the graph cleanly from the beginning.
+    # This handles both "completed-with-failures" (hit max-iterations)
+    # and "interrupted" (GraphRecursionError / Ctrl-C) cases.
     if resume:
-        input_state = {"output_dir": output_dir or "", "skills_context": skills_context}
+        saved = app.get_state(config)
+        if not saved or not saved.values:
+            raise click.UsageError(
+                f"No checkpoint found for thread '{thread_id}'. "
+                "Nothing to resume."
+            )
+
+        # Capture the full accumulated state before touching the checkpoint
+        input_state: dict[str, Any] = dict(saved.values)
+
+        # Override with CLI-supplied values
+        input_state["output_dir"] = output_dir or input_state.get("output_dir", "")
+        input_state["skills_context"] = skills_context or input_state.get("skills_context", "")
         if task:
             input_state["task_description"] = task
+
+        iters = input_state.get("iteration_count", 0)
+        drafts = len(input_state.get("code_drafts", {}))
+        phase_info = ""
+        phases = input_state.get("plan_phases") or []
+        if phases:
+            cur = input_state.get("current_phase", 0)
+            phase_info = f", phase {cur + 1}/{len(phases)}"
+        click.echo(
+            f"♻ Restoring state: {iters} iteration(s), "
+            f"{drafts} file(s){phase_info}"
+        )
+
+        # Delete the old checkpoint so the graph starts from the entry
+        # point (planner) with the full accumulated context.
+        checkpointer.delete_thread(thread_id)
     else:
         input_state = {
             "task_description": task,
@@ -334,6 +364,85 @@ def run(task: str | None, task_file: str | None, thread_id: str, db: str,
         click.echo("\n".join(logs))
 
     sys.exit(0 if not logs else 1)
+
+
+@cli.command("status")
+@click.argument("thread_id")
+@click.option(
+    "--db",
+    default="checkpoints.sqlite",
+    show_default=True,
+    type=click.Path(),
+    help="SQLite file for checkpointing.",
+)
+def status(thread_id: str, db: str) -> None:
+    """Show the status of a workflow run.
+
+    Reads the checkpoint for THREAD_ID and prints a summary including
+    the task, iteration count, test status, phase progress, and files.
+    """
+    checkpointer = make_checkpointer(db)
+    graph = build_graph()
+    app = graph.compile(checkpointer=checkpointer)
+    config = {"configurable": {"thread_id": thread_id}}
+
+    saved = app.get_state(config)
+    if not saved or not saved.values:
+        click.echo(f"No checkpoint found for thread '{thread_id}'.")
+        sys.exit(1)
+
+    vals = saved.values
+    task = vals.get("task_description", "")
+    iters = vals.get("iteration_count", 0)
+    test_logs = vals.get("test_logs", [])
+    phases = vals.get("plan_phases") or []
+    current_phase = vals.get("current_phase", 0)
+    code_drafts = vals.get("code_drafts", {})
+    output_dir = vals.get("output_dir", "")
+
+    # Determine overall status
+    if not test_logs:
+        if phases and current_phase + 1 < len(phases):
+            overall = "✔ Tests passing — more phases remain"
+        else:
+            overall = "✔ Completed successfully"
+    else:
+        overall = "✘ Stopped with failing tests"
+
+    # Print summary
+    click.echo(f"Thread   : {thread_id}")
+    click.echo(f"Status   : {overall}")
+    click.echo(f"Task     : {task[:120]}{'…' if len(task) > 120 else ''}")
+    click.echo(f"Iterations: {iters}")
+    click.echo(f"Files    : {len(code_drafts)}")
+    if output_dir:
+        click.echo(f"Output   : {output_dir}")
+
+    # Phase progress
+    if phases:
+        click.echo(f"\nPhases ({current_phase + 1}/{len(phases)}):")
+        for p in phases:
+            marker = {"completed": "✔", "in-progress": "▶", "pending": "○"}.get(
+                p.get("status", "pending"), "?"
+            )
+            files_str = f"  [{', '.join(p.get('files', []))}]" if p.get("files") else ""
+            click.echo(f"  {marker} Phase {p['id']}: {p['title']}{files_str}")
+
+    # File list
+    if code_drafts:
+        click.echo(f"\nGenerated files:")
+        for path in sorted(code_drafts):
+            lines = code_drafts[path].count("\n")
+            click.echo(f"  {path} ({lines} lines)")
+
+    # Last error excerpt
+    if test_logs:
+        click.echo(f"\nLast error (truncated):")
+        excerpt = "\n".join(test_logs)
+        if len(excerpt) > 500:
+            excerpt = excerpt[:500] + "\n  …"
+        for line in excerpt.split("\n"):
+            click.echo(f"  │ {line}")
 
 
 @cli.command("check-llm")

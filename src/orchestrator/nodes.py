@@ -469,7 +469,10 @@ def verifier(state: ScientificState) -> dict[str, Any]:
     """
     code_drafts: dict[str, str] = state.get("code_drafts", {})
     if not code_drafts:
-        return {"test_logs": ["No code drafts to verify."]}
+        return {
+            "test_logs": ["No code drafts to verify."],
+            "iteration_count": state.get("iteration_count", 0) + 1,
+        }
 
     output_dir = state.get("output_dir", "")
 
