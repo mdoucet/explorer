@@ -6,6 +6,7 @@ state dict that LangGraph merges back into the graph state.
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import subprocess
@@ -255,12 +256,44 @@ def advance_phase(state: ScientificState) -> dict[str, Any]:
         "plan_phases": phases,
         "current_phase": next_idx,
         "reflection": "",  # clear stale reflection for new phase
+        "ground_truth": [],  # clear stale findings for new phase
     }
 
 
 # ---------------------------------------------------------------------------
 # 2. Coder
 # ---------------------------------------------------------------------------
+
+
+def _extract_signatures(source: str) -> list[str]:
+    """Extract function and class signatures from Python *source*.
+
+    Returns a list of concise signature strings, e.g.::
+
+        ["def solve_square_well(n: int, L: float) -> np.ndarray",
+         "class Solver"]
+
+    Non-Python files or unparseable source silently return an empty list.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    sigs: list[str] = []
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            sigs.append(f"def {node.name}({ast.unparse(node.args)})")
+        elif isinstance(node, ast.ClassDef):
+            methods = [
+                f"  def {n.name}({ast.unparse(n.args)})"
+                for n in ast.iter_child_nodes(node)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
+            sigs.append(f"class {node.name}")
+            sigs.extend(methods)
+    return sigs
+
 
 def _write_code_drafts(
     code_drafts: dict[str, str],
@@ -310,10 +343,18 @@ def coder(state: ScientificState) -> dict[str, Any]:
     # Inform coder about files that already exist from prior phases
     existing_drafts = state.get("code_drafts") or {}
     if existing_drafts:
-        file_list = ", ".join(sorted(existing_drafts.keys()))
+        sig_lines: list[str] = []
+        for fpath in sorted(existing_drafts.keys()):
+            sigs = _extract_signatures(existing_drafts[fpath])
+            if sigs:
+                sig_lines.append(f"### {fpath}\n" + "\n".join(sigs))
+            else:
+                sig_lines.append(f"### {fpath}")
         user_parts.append(
-            f"## Existing files from prior phases\n"
-            f"These files already exist and can be imported: {file_list}"
+            "## Existing files from prior phases\n"
+            "These files already exist and can be imported.  Use the "
+            "exact names shown below when importing.\n\n"
+            + "\n\n".join(sig_lines)
         )
 
     if state.get("skills_context"):
@@ -458,6 +499,72 @@ def _prepare_sandbox(root: Path, code_drafts: dict[str, str]) -> None:
     )
 
 
+def _check_import_consistency(code_drafts: dict[str, str]) -> list[str]:
+    """Check that names imported in test files are actually defined in source modules.
+
+    Returns a list of human-readable error strings (empty if consistent).
+    Only checks ``from <module> import <name>`` statements in test files
+    against top-level definitions in non-test ``.py`` files.
+    """
+    # Build a map: module_dotted_path -> set of top-level names defined
+    defined: dict[str, set[str]] = {}
+    for fpath, source in code_drafts.items():
+        if not fpath.endswith(".py"):
+            continue
+        # Skip test files and __init__.py
+        basename = fpath.rsplit("/", 1)[-1] if "/" in fpath else fpath
+        if basename.startswith("test_") or basename == "__init__.py":
+            continue
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        names: set[str] = set()
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.ClassDef):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        names.add(t.id)
+        # Convert file path to dotted module path
+        mod_path = fpath.removesuffix(".py").replace("/", ".")
+        # Also store without leading "src." for src-layout projects
+        defined[mod_path] = names
+        if mod_path.startswith("src."):
+            defined[mod_path.removeprefix("src.")] = names
+
+    # Scan test files for `from X import Y` and cross-check
+    errors: list[str] = []
+    for fpath, source in code_drafts.items():
+        if not fpath.endswith(".py"):
+            continue
+        basename = fpath.rsplit("/", 1)[-1] if "/" in fpath else fpath
+        if not basename.startswith("test_"):
+            continue
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.module is None:
+                continue
+            mod = node.module
+            if mod not in defined:
+                continue
+            for alias in node.names:
+                name = alias.name
+                if name not in defined[mod]:
+                    available = ", ".join(sorted(defined[mod])) or "(nothing)"
+                    errors.append(
+                        f"Import mismatch: {fpath} imports '{name}' from "
+                        f"'{mod}', but '{mod}' only defines: {available}"
+                    )
+    return errors
+
+
 def verifier(state: ScientificState) -> dict[str, Any]:
     """Run ``pytest`` against the generated code.
 
@@ -474,18 +581,22 @@ def verifier(state: ScientificState) -> dict[str, Any]:
             "iteration_count": state.get("iteration_count", 0) + 1,
         }
 
+    # Quick import consistency check before running pytest
+    import_errors = _check_import_consistency(code_drafts)
+
     output_dir = state.get("output_dir", "")
 
     if output_dir:
         # Write mode — run pytest in the real output directory
         root = Path(output_dir).resolve()
-        logs = _run_pytest(root)
+        logs = import_errors or _run_pytest(root)
     else:
         # Sandbox mode — temp dir with auto-cleanup
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             _prepare_sandbox(root, code_drafts)
-            logs = _run_pytest(root)
+            print(f"[explorer] Sandbox directory: {root}")
+            logs = import_errors or _run_pytest(root)
 
     return {
         "test_logs": logs,

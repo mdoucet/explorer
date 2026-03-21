@@ -9,6 +9,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from orchestrator.nodes import (
+    _check_import_consistency,
+    _extract_signatures,
     _looks_like_filepath,
     _parse_code_blocks,
     _parse_plan_phases,
@@ -571,3 +573,148 @@ class TestCoderPhaseContext:
 
         assert "solver.py" in result["_prompt_summary"]
         assert "Existing files" in result["_prompt_summary"]
+
+    def test_coder_includes_signatures_of_existing_files(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        llm_output = "```cli.py\nprint('cli')\n```\n"
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        existing = {
+            "solver.py": "def solve_square_well(n: int) -> float:\n    pass\n",
+        }
+        state = _base_state(plan="Build CLI.", code_drafts=existing)
+        result = coder(state)
+
+        # Prompt should contain the actual function signature
+        assert "solve_square_well" in result["_prompt_summary"]
+        assert "exact names" in result["_prompt_summary"].lower()
+
+
+# ---------------------------------------------------------------------------
+# _extract_signatures
+# ---------------------------------------------------------------------------
+
+class TestExtractSignatures:
+    def test_extracts_functions(self) -> None:
+        source = (
+            "def solve(n: int, L: float) -> float:\n"
+            "    pass\n\n"
+            "def helper():\n"
+            "    pass\n"
+        )
+        sigs = _extract_signatures(source)
+        assert len(sigs) == 2
+        assert "solve" in sigs[0]
+        assert "helper" in sigs[1]
+
+    def test_extracts_classes_and_methods(self) -> None:
+        source = (
+            "class Solver:\n"
+            "    def run(self, x: int) -> None:\n"
+            "        pass\n"
+        )
+        sigs = _extract_signatures(source)
+        assert any("class Solver" in s for s in sigs)
+        assert any("run" in s for s in sigs)
+
+    def test_returns_empty_for_invalid_syntax(self) -> None:
+        assert _extract_signatures("def !!!broken") == []
+
+    def test_returns_empty_for_non_python(self) -> None:
+        assert _extract_signatures("[project]\nname = 'foo'\n") == []
+
+
+# ---------------------------------------------------------------------------
+# _check_import_consistency
+# ---------------------------------------------------------------------------
+
+class TestCheckImportConsistency:
+    def test_consistent_imports_pass(self) -> None:
+        drafts = {
+            "solver.py": "def solve(n: int) -> float:\n    pass\n",
+            "tests/test_solver.py": (
+                "from solver import solve\n"
+                "def test_it():\n    assert solve(1) == 1.0\n"
+            ),
+        }
+        assert _check_import_consistency(drafts) == []
+
+    def test_mismatched_import_detected(self) -> None:
+        drafts = {
+            "solver.py": "def solve_square_well(n: int) -> float:\n    pass\n",
+            "tests/test_solver.py": (
+                "from solver import solve_eigenvalue\n"
+                "def test_it():\n    assert solve_eigenvalue(1) == 1.0\n"
+            ),
+        }
+        errors = _check_import_consistency(drafts)
+        assert len(errors) == 1
+        assert "solve_eigenvalue" in errors[0]
+        assert "solve_square_well" in errors[0]
+
+    def test_ignores_unknown_modules(self) -> None:
+        """Imports from external packages should not trigger errors."""
+        drafts = {
+            "solver.py": "def solve() -> None:\n    pass\n",
+            "tests/test_solver.py": (
+                "import numpy as np\n"
+                "from solver import solve\n"
+                "def test_it():\n    solve()\n"
+            ),
+        }
+        assert _check_import_consistency(drafts) == []
+
+    def test_handles_src_layout(self) -> None:
+        drafts = {
+            "src/pkg/solver.py": "def solve() -> None:\n    pass\n",
+            "tests/test_solver.py": (
+                "from pkg.solver import solve\n"
+                "def test_it():\n    solve()\n"
+            ),
+        }
+        assert _check_import_consistency(drafts) == []
+
+    def test_class_imports_pass(self) -> None:
+        drafts = {
+            "engine.py": "class Engine:\n    pass\n",
+            "tests/test_engine.py": (
+                "from engine import Engine\n"
+                "def test_it():\n    Engine()\n"
+            ),
+        }
+        assert _check_import_consistency(drafts) == []
+
+    def test_top_level_assignment_counted(self) -> None:
+        drafts = {
+            "constants.py": "PI = 3.14159\n",
+            "tests/test_constants.py": (
+                "from constants import PI\n"
+                "def test_pi():\n    assert PI > 3\n"
+            ),
+        }
+        assert _check_import_consistency(drafts) == []
+
+
+# ---------------------------------------------------------------------------
+# advance_phase clears ground_truth
+# ---------------------------------------------------------------------------
+
+class TestAdvancePhaseGroundTruth:
+    def test_clears_ground_truth_on_advance(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        phases = [
+            {"id": 1, "title": "Core", "description": "Build core.", "status": "pending", "files": []},
+            {"id": 2, "title": "CLI", "description": "Build CLI.", "status": "pending", "files": []},
+        ]
+        state = _base_state(
+            plan_phases=phases,
+            current_phase=0,
+            ground_truth=["- stale finding from phase 1"],
+        )
+        result = advance_phase(state)
+
+        assert result["ground_truth"] == []
