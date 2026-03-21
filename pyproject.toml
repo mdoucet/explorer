@@ -15,8 +15,9 @@ dependencies = [
     "langchain-ollama>=0.2",
     "click>=8",
     "python-dotenv>=1",
-    "jax[cpu]",
+    "langsmith>=0.1",
     "numpy",
+    "scipy",
 ]
 
 [project.optional-dependencies]

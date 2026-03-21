@@ -26,7 +26,7 @@ Phase 1: Environment & State Definition
 Prompt: "Switch to Agent Mode. I need to implement a reusable agentic framework using LangGraph for scientific Python development.
 
 Step 1: Create a src/orchestrator/state.py file. Define a TypedDict called ScientificState that tracks: task_description, mathematical_constants, code_drafts (Dict), test_logs (List), and iteration_count.
-Step 2: Use JAX and NumPy as the primary numerical backends. Ensure the state can persist using the SqliteSaver checkpointer for long-running sessions."
+Step 2: Use NumPy and SciPy as the primary numerical backends. Ensure the state can persist using the SqliteSaver checkpointer for long-running sessions."
 
 Phase 2: The "Scientific Method" Nodes
 Prompt: "Now, implement the core nodes in src/orchestrator/nodes.py:
@@ -53,7 +53,7 @@ Recommended .github/copilot-instructions.md Content:
 Markdown
 ## Scientific Coding Standards
 - Always use Type Hints (Python 3.12+).
-- Prefer JAX for differentiability in physics engines.
+- Prefer NumPy/SciPy for numerical computation.
 - Use Docstrings that include the LaTeX physics formulas being implemented.
 
 ## Agent Autonomy

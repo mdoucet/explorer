@@ -7,6 +7,7 @@ state dict that LangGraph merges back into the graph state.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -84,17 +85,99 @@ def get_llm() -> ChatOpenAI | ChatOllama:
 
 
 # ---------------------------------------------------------------------------
+# Plan phase helpers
+# ---------------------------------------------------------------------------
+
+_PHASE_RE = re.compile(
+    r"^##\s+Phase\s+(\d+)\s*:\s*(.+)$",
+    re.MULTILINE,
+)
+
+
+def _parse_plan_phases(text: str) -> list[dict[str, Any]]:
+    """Parse ``## Phase N: Title`` sections from the planner's Markdown output.
+
+    Returns a list of dicts with keys ``id``, ``title``, ``description``,
+    ``status``, and ``files``.  Falls back to a single phase containing the
+    entire text if no ``## Phase`` headers are found.
+    """
+    matches = list(_PHASE_RE.finditer(text))
+    if not matches:
+        return [{
+            "id": 1,
+            "title": "Implementation",
+            "description": text.strip(),
+            "status": "pending",
+            "files": [],
+        }]
+
+    phases: list[dict[str, Any]] = []
+    for idx, match in enumerate(matches):
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+
+        # Extract "Files:" line if present
+        files: list[str] = []
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.lower().startswith("files:"):
+                raw = stripped.split(":", 1)[1].strip()
+                files = [f.strip() for f in raw.split(",") if f.strip()]
+                break
+
+        phases.append({
+            "id": int(match.group(1)),
+            "title": match.group(2).strip(),
+            "description": body,
+            "status": "pending",
+            "files": files,
+        })
+
+    return phases
+
+
+def _write_plan_artifact(phases: list[dict[str, Any]], current: int) -> None:
+    """Write (or overwrite) ``plan.md`` with the phased plan and status."""
+    lines = ["# Plan\n"]
+    for phase in phases:
+        pid = phase["id"]
+        title = phase["title"]
+        status = phase["status"]
+        if status == "completed":
+            check = "x"
+        elif pid == phases[current]["id"]:
+            check = "~"  # in-progress marker
+        else:
+            check = " "
+        lines.append(f"## [{check}] Phase {pid}: {title}\n")
+        lines.append(f"**Status:** {status}\n")
+        if phase.get("files"):
+            lines.append(f"**Files:** {', '.join(phase['files'])}\n")
+        lines.append(phase["description"])
+        lines.append("")
+    lines.append("")
+    Path("plan.md").write_text("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
 # 1. Planner
 # ---------------------------------------------------------------------------
 
 
 def planner(state: ScientificState) -> dict[str, Any]:
-    """Analyse the task and produce a mathematical spec + file-tree plan.
+    """Analyse the task and produce a phased implementation plan.
 
-    Uses the ``reflection`` field (if present) to incorporate learnings from
-    previous failed iterations.
+    On the first call the planner generates a full multi-phase plan.
+    On subsequent calls (reflection loop) it revises only the current phase.
+    The full plan and its current phase are returned so that downstream
+    nodes always receive structured phase information.
     """
     llm = get_llm()
+
+    # Detect whether this is a revision (reflection loop) or a fresh plan
+    existing_phases: list[dict[str, Any]] = list(state.get("plan_phases") or [])
+    is_revision = bool(state.get("reflection")) and bool(existing_phases)
 
     user_parts: list[str] = [f"## Task\n{state['task_description']}"]
     if state.get("reflection"):
@@ -107,11 +190,72 @@ def planner(state: ScientificState) -> dict[str, Any]:
         user_parts.append(state["skills_context"])
 
     prompt = _load_prompt("EXPLORER_PROMPT_PLANNER", "planner.md")
+    user_message = "\n\n".join(user_parts)
     response = llm.invoke([
         SystemMessage(content=prompt),
-        HumanMessage(content="\n\n".join(user_parts)),
+        HumanMessage(content=user_message),
     ])
-    return {"plan": response.content}
+
+    raw_plan = response.content
+
+    if is_revision:
+        # Only update the current phase's description; keep the rest intact
+        current_idx = state.get("current_phase", 0)
+        revised_phases = _parse_plan_phases(raw_plan)
+        # Use the first revised phase to update the current one
+        if revised_phases:
+            existing_phases[current_idx]["description"] = revised_phases[0]["description"]
+            if revised_phases[0]["files"]:
+                existing_phases[current_idx]["files"] = revised_phases[0]["files"]
+        plan_phases = existing_phases
+        current_phase = current_idx
+    else:
+        # Fresh plan: parse all phases
+        plan_phases = _parse_plan_phases(raw_plan)
+        current_phase = 0
+
+    # Set `plan` to the current phase description for backward compatibility
+    plan_text = plan_phases[current_phase]["description"]
+
+    _write_plan_artifact(plan_phases, current_phase)
+
+    return {
+        "plan": plan_text,
+        "plan_phases": plan_phases,
+        "current_phase": current_phase,
+        "_prompt_summary": user_message,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase advancement
+# ---------------------------------------------------------------------------
+
+
+def advance_phase(state: ScientificState) -> dict[str, Any]:
+    """Mark the current phase as completed and advance to the next one.
+
+    Updates ``plan`` to the next phase's description so the coder picks
+    it up on the next iteration.  Also re-writes the plan artefact.
+    """
+    phases = list(state.get("plan_phases") or [])
+    current = state.get("current_phase", 0)
+
+    # Mark current phase completed
+    phases[current]["status"] = "completed"
+
+    next_idx = current + 1
+    phases[next_idx]["status"] = "in-progress"
+    plan_text = phases[next_idx]["description"]
+
+    _write_plan_artifact(phases, next_idx)
+
+    return {
+        "plan": plan_text,
+        "plan_phases": phases,
+        "current_phase": next_idx,
+        "reflection": "",  # clear stale reflection for new phase
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -141,34 +285,79 @@ def _write_code_drafts(
 
 
 def coder(state: ScientificState) -> dict[str, Any]:
-    """Generate Python source code from the current plan.
+    """Generate Python source code from the current plan phase.
 
     Returns
     -------
     dict
         ``code_drafts``: ``{filepath: source_code}`` mapping extracted from
-        the LLM response.
+        the LLM response.  Accumulated over phases — prior-phase files are
+        preserved.
     """
     llm = get_llm()
     prompt = _load_prompt("EXPLORER_PROMPT_CODER", "coder.md")
 
-    user_parts: list[str] = [f"## Plan\n{state['plan']}"]
+    # Phase context for the coder
+    phases = state.get("plan_phases") or []
+    current = state.get("current_phase", 0)
+    total = len(phases) if phases else 1
+    phase_title = phases[current]["title"] if phases else "Implementation"
+
+    user_parts: list[str] = [
+        f"## Current Phase ({current + 1} of {total}): {phase_title}\n{state['plan']}",
+    ]
+
+    # Inform coder about files that already exist from prior phases
+    existing_drafts = state.get("code_drafts") or {}
+    if existing_drafts:
+        file_list = ", ".join(sorted(existing_drafts.keys()))
+        user_parts.append(
+            f"## Existing files from prior phases\n"
+            f"These files already exist and can be imported: {file_list}"
+        )
+
     if state.get("skills_context"):
         user_parts.append(state["skills_context"])
 
+    user_message = "\n\n".join(user_parts)
     response = llm.invoke([
         SystemMessage(content=prompt),
-        HumanMessage(content="\n\n".join(user_parts)),
+        HumanMessage(content=user_message),
     ])
 
-    code_drafts = _parse_code_blocks(response.content)
+    raw_content = response.content
+    new_drafts = _parse_code_blocks(raw_content)
+
+    # Merge new drafts into accumulated drafts (new files override old)
+    merged_drafts = dict(existing_drafts)
+    merged_drafts.update(new_drafts)
 
     # In write mode, persist files to the output directory
     output_dir = state.get("output_dir", "")
     if output_dir:
-        _write_code_drafts(code_drafts, output_dir)
+        _write_code_drafts(new_drafts, output_dir)
 
-    return {"code_drafts": code_drafts}
+    return {"code_drafts": merged_drafts, "coder_raw_response": raw_content, "_prompt_summary": user_message}
+
+
+_FILE_EXTENSIONS = frozenset({
+    ".py", ".toml", ".cfg", ".ini", ".txt", ".md", ".rst",
+    ".yaml", ".yml", ".json", ".csv", ".sh", ".bat",
+    ".html", ".css", ".js", ".ts", ".sql", ".r", ".jl",
+})
+
+
+def _looks_like_filepath(info_string: str) -> bool:
+    """Return True if *info_string* appears to be a file path rather than a
+    language tag (e.g. ``python``, ``bash``).
+
+    Heuristic: contains ``/`` **or** ends with a recognised file extension.
+    """
+    if "/" in info_string:
+        return True
+    # Check for known file extension (e.g. "pyproject.toml", "conftest.py")
+    _, dot, ext = info_string.rpartition(".")
+    return dot == "." and f".{ext}" in _FILE_EXTENSIONS
 
 
 def _parse_code_blocks(text: str) -> dict[str, str]:
@@ -178,14 +367,15 @@ def _parse_code_blocks(text: str) -> dict[str, str]:
     i = 0
     while i < len(lines):
         line = lines[i]
-        if line.startswith("```") and "/" in line:
-            path = line.strip().removeprefix("```").strip()
-            code_lines: list[str] = []
-            i += 1
-            while i < len(lines) and not lines[i].startswith("```"):
-                code_lines.append(lines[i])
+        if line.startswith("```"):
+            info = line.strip().removeprefix("```").strip()
+            if info and _looks_like_filepath(info):
+                code_lines: list[str] = []
                 i += 1
-            drafts[path] = "".join(code_lines)
+                while i < len(lines) and not lines[i].startswith("```"):
+                    code_lines.append(lines[i])
+                    i += 1
+                drafts[info] = "".join(code_lines)
         i += 1
     return drafts
 
@@ -195,18 +385,77 @@ def _parse_code_blocks(text: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def _run_pytest(root: Path) -> list[str]:
+def _run_pytest(root: Path, extra_env: dict[str, str] | None = None) -> list[str]:
     """Run ``pytest`` inside *root* and return failure logs (empty on success)."""
+    env = {**os.environ, **(extra_env or {})}
     result = subprocess.run(  # noqa: S603
         ["python", "-m", "pytest", str(root), "-v", "--tb=short"],
         capture_output=True,
         text=True,
         timeout=120,
         cwd=str(root),
+        env=env,
     )
     if result.returncode != 0:
         return [result.stdout + "\n" + result.stderr]
     return []
+
+
+def _prepare_sandbox(root: Path, code_drafts: dict[str, str]) -> None:
+    """Write *code_drafts* into *root* and make imports work.
+
+    Strategy:
+    1. If the coder produced a ``pyproject.toml``, run ``pip install -e .``
+       inside *root* so normal ``import pkg`` statements just work.
+    2. Otherwise generate a ``conftest.py`` that adds all package-containing
+       directories to ``sys.path`` (handles both flat and ``src/`` layouts).
+    3. Never overwrite a coder-generated ``conftest.py``.
+    """
+    # Write all files
+    for rel_path, source in code_drafts.items():
+        target = root / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source)
+
+    # Attempt editable install if pyproject.toml is present
+    if (root / "pyproject.toml").exists():
+        pip_result = subprocess.run(  # noqa: S603
+            ["python", "-m", "pip", "install", "-e", str(root),
+             "--no-build-isolation", "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(root),
+        )
+        if pip_result.returncode == 0:
+            return  # install succeeded — imports will work
+
+    # Fallback: generate a conftest that sets up sys.path
+    if (root / "conftest.py").exists():
+        return  # don't overwrite coder-generated conftest
+
+    # Collect directories that look like Python packages (contain __init__.py)
+    # and their parent directories.
+    path_roots: set[str] = set()
+    path_roots.add(str(root))  # always include the project root
+    if (root / "src").is_dir():
+        path_roots.add(str(root / "src"))
+    for init in root.rglob("__init__.py"):
+        # Add the parent of the top-level package directory
+        pkg_dir = init.parent
+        # Walk up to find the top-level package root
+        while (pkg_dir.parent / "__init__.py").exists():
+            pkg_dir = pkg_dir.parent
+        path_roots.add(str(pkg_dir.parent))
+
+    path_lines = "\n".join(
+        f'    sys.path.insert(0, {p!r})' for p in sorted(path_roots)
+    )
+    (root / "conftest.py").write_text(
+        "import sys\n\n\n"
+        "def pytest_configure(config):\n"
+        f"{path_lines}\n"
+    )
 
 
 def verifier(state: ScientificState) -> dict[str, Any]:
@@ -232,16 +481,7 @@ def verifier(state: ScientificState) -> dict[str, Any]:
         # Sandbox mode — temp dir with auto-cleanup
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            for rel_path, source in code_drafts.items():
-                target = root / rel_path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(source)
-
-            # Generate a minimal conftest so imports resolve
-            (root / "conftest.py").write_text(
-                "import sys, pathlib\nsys.path.insert(0, str(pathlib.Path(__file__).parent))\n"
-            )
-
+            _prepare_sandbox(root, code_drafts)
             logs = _run_pytest(root)
 
     return {
@@ -262,9 +502,10 @@ def reflector(state: ScientificState) -> dict[str, Any]:
     findings_prompt = _load_prompt("EXPLORER_PROMPT_FINDINGS", "findings.md")
 
     log_text = "\n---\n".join(state.get("test_logs", []))
+    reflector_user_msg = f"## Test logs\n```\n{log_text}\n```"
     response = llm.invoke([
         SystemMessage(content=reflector_prompt),
-        HumanMessage(content=f"## Test logs\n```\n{log_text}\n```"),
+        HumanMessage(content=reflector_user_msg),
     ])
     reflection = response.content
 
@@ -284,4 +525,4 @@ def reflector(state: ScientificState) -> dict[str, Any]:
             if line.startswith("- "):
                 existing.append(line)
 
-    return {"reflection": reflection, "ground_truth": existing}
+    return {"reflection": reflection, "ground_truth": existing, "_prompt_summary": reflector_user_msg}

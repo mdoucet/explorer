@@ -42,6 +42,15 @@ class ScientificState(TypedDict, total=False):
     skills_context : str
         Concatenated content of matched skills, injected into planner and
         coder prompts.  Empty string when no skills apply.
+    coder_raw_response : str
+        Raw text returned by the LLM in the coder node, before parsing.
+        Stored for diagnostic purposes when ``code_drafts`` is empty.
+    plan_phases : list[dict]
+        Ordered list of plan phases produced by the planner.  Each dict has
+        keys ``id`` (int), ``title`` (str), ``description`` (str),
+        ``status`` (str), and ``files`` (list[str]).
+    current_phase : int
+        Zero-based index of the phase the coder is currently working on.
     """
 
     task_description: str
@@ -54,6 +63,9 @@ class ScientificState(TypedDict, total=False):
     ground_truth: list[str]
     output_dir: str
     skills_context: str
+    coder_raw_response: str
+    plan_phases: list[dict]
+    current_phase: int
 
 
 def make_checkpointer(db_path: str = "checkpoints.sqlite") -> SqliteSaver:

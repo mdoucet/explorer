@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import os
 import sys
+import uuid
 import warnings
 from pathlib import Path
+from typing import Any
 
 # Suppress urllib3 warning on macOS system Python compiled with LibreSSL
 warnings.filterwarnings("ignore", message=".*LibreSSL.*", category=UserWarning)
@@ -22,7 +24,7 @@ import click
 from dotenv import load_dotenv
 from langgraph.graph import END, StateGraph
 
-from orchestrator.nodes import coder, configure_llm, get_llm, planner, reflector, verifier
+from orchestrator.nodes import advance_phase, coder, configure_llm, get_llm, planner, reflector, verifier
 from orchestrator.state import ScientificState, make_checkpointer
 
 # Load .env file (if present) so env vars are available as CLI defaults
@@ -36,9 +38,20 @@ MAX_ITERATIONS = 50
 # ---------------------------------------------------------------------------
 
 def _make_should_continue(max_iters: int):
-    """Return a conditional edge function with a configurable iteration cap."""
+    """Return a conditional edge function with a configurable iteration cap.
+
+    Three outcomes:
+    - ``"end"``           — tests passed and all phases are done
+    - ``"advance_phase"`` — tests passed but more phases remain
+    - ``"reflect"``       — tests failed and we haven't hit the cap
+    """
     def _should_continue(state: ScientificState) -> str:
         if not state.get("test_logs"):
+            # Tests passed — check if there are more phases
+            phases = state.get("plan_phases") or []
+            current = state.get("current_phase", 0)
+            if phases and current + 1 < len(phases):
+                return "advance_phase"
             return "end"
         if state.get("iteration_count", 0) >= max_iters:
             return "end"
@@ -54,6 +67,7 @@ def build_graph(max_iterations: int = MAX_ITERATIONS) -> StateGraph:
     graph.add_node("coder", coder)
     graph.add_node("verifier", verifier)
     graph.add_node("reflector", reflector)
+    graph.add_node("advance_phase", advance_phase)
 
     graph.set_entry_point("planner")
     graph.add_edge("planner", "coder")
@@ -61,9 +75,10 @@ def build_graph(max_iterations: int = MAX_ITERATIONS) -> StateGraph:
     graph.add_conditional_edges(
         "verifier",
         _make_should_continue(max_iterations),
-        {"reflect": "reflector", "end": END},
+        {"reflect": "reflector", "advance_phase": "advance_phase", "end": END},
     )
     graph.add_edge("reflector", "planner")
+    graph.add_edge("advance_phase", "coder")
 
     return graph
 
@@ -117,9 +132,9 @@ def cli() -> None:
 )
 @click.option(
     "--thread-id",
-    default="default",
-    show_default=True,
-    help="Thread ID for checkpoint persistence.",
+    default=None,
+    help="Thread ID for checkpoint persistence.  "
+         "Omit to start a fresh run with an auto-generated ID.",
 )
 @click.option(
     "--db",
@@ -173,27 +188,67 @@ def cli() -> None:
     type=click.Path(exists=True, file_okay=False),
     help="Directories containing skill folders (repeatable).",
 )
+@click.option(
+    "--chat-dir",
+    default=None,
+    type=click.Path(file_okay=False),
+    help="Directory to save the full chat log of the run. "
+         "Default: no chat log.",
+)
+@click.option(
+    "--resume", "-r",
+    is_flag=True,
+    default=False,
+    help="Resume a previous run from its checkpoint. "
+         "Requires --thread-id.",
+)
 def run(task: str | None, task_file: str | None, thread_id: str, db: str,
         max_iterations: int, provider: str, model: str,
         base_url: str | None, temperature: float,
-        output_dir: str | None, skills: tuple[str, ...]) -> None:
+        output_dir: str | None, skills: tuple[str, ...],
+        chat_dir: str | None, resume: bool) -> None:
     """Run the Scientific Loop agent on a task.
 
     Provide either --task/-t with inline text, or --task-file/-f pointing to a
     Markdown file.  At least one is required.
     """
-    if task and task_file:
-        raise click.UsageError("Use --task or --task-file, not both.")
-    if task_file:
-        task = Path(task_file).read_text()
-    if not task:
-        raise click.UsageError("Provide either --task or --task-file.")
+    if resume and not thread_id:
+        raise click.UsageError("--resume requires --thread-id.")
+    if not resume:
+        if task and task_file:
+            raise click.UsageError("Use --task or --task-file, not both.")
+        if task_file:
+            task = Path(task_file).read_text()
+        if not task:
+            raise click.UsageError("Provide either --task or --task-file.")
+    else:
+        # When resuming, task is loaded from the checkpoint; allow
+        # an optional override via --task / --task-file.
+        if task_file:
+            task = Path(task_file).read_text()
+
+    # Set LangSmith project name if tracing is enabled but no project set
+    if os.environ.get("LANGCHAIN_TRACING_V2", "").lower() == "true":
+        if not os.environ.get("LANGCHAIN_PROJECT"):
+            os.environ["LANGCHAIN_PROJECT"] = "explorer"
+        click.echo(f"🔍 LangSmith tracing → project: {os.environ['LANGCHAIN_PROJECT']}")
 
     configure_llm(
         provider=provider, model=model,
         base_url=base_url, temperature=temperature,
     )
+    # Generate a unique thread ID when none is supplied, so each run
+    # starts with a clean slate and stale checkpoints never interfere.
+    if thread_id is None:
+        thread_id = uuid.uuid4().hex[:12]
+
     checkpointer = make_checkpointer(db)
+
+    if not resume:
+        # Fresh run — clear any leftover checkpoint so the graph
+        # always starts from initial_state.
+        checkpointer.delete_thread(thread_id)
+
     graph = build_graph(max_iterations=max_iterations)
     app = graph.compile(checkpointer=checkpointer)
 
@@ -215,28 +270,62 @@ def run(task: str | None, task_file: str | None, thread_id: str, db: str,
         else:
             click.echo(f"📚 Loaded {len(all_skills)} skill(s), none matched the task.")
 
-    initial_state: ScientificState = {
-        "task_description": task,
-        "mathematical_constants": {},
-        "plan": "",
-        "code_drafts": {},
-        "test_logs": [],
-        "reflection": "",
-        "iteration_count": 0,
-        "ground_truth": [],
-        "output_dir": output_dir or "",
-        "skills_context": skills_context,
-    }
-
     config = {"configurable": {"thread_id": thread_id}}
 
-    click.echo(f"▶ Starting Scientific Loop (thread={thread_id})")
-    final_state = app.invoke(initial_state, config=config)
+    # When resuming, pass None so LangGraph picks up from the checkpoint;
+    # otherwise supply a full initial state for a fresh start.
+    if resume:
+        input_state = {"output_dir": output_dir or "", "skills_context": skills_context}
+        if task:
+            input_state["task_description"] = task
+    else:
+        input_state = {
+            "task_description": task,
+            "mathematical_constants": {},
+            "plan": "",
+            "code_drafts": {},
+            "test_logs": [],
+            "reflection": "",
+            "iteration_count": 0,
+            "ground_truth": [],
+            "output_dir": output_dir or "",
+            "skills_context": skills_context,
+            "plan_phases": [],
+            "current_phase": 0,
+        }
+
+    # Set up reporting
+    from orchestrator.reporter import ChatLogger, report_node
+
+    matched_skill_names: list[str] = [s.name for s in matched] if skills and matched else []
+    chat_logger = ChatLogger(
+        chat_dir,
+        task=task or "",
+        skills=matched_skill_names,
+        provider=provider,
+        model=model,
+        max_iterations=max_iterations,
+    ) if chat_dir else None
+
+    verb = "Resuming" if resume else "Starting"
+    click.echo(f"▶ {verb} Scientific Loop (thread={thread_id})")
+
+    # Stream node-by-node for live reporting
+    final_state: dict[str, Any] = dict(input_state)
+    for event in app.stream(input_state, config=config):
+        for node_name, update in event.items():
+            report_node(node_name, update)
+            if chat_logger:
+                chat_logger.log_node(node_name, update)
+            final_state.update(update)
 
     iters = final_state.get("iteration_count", 0)
     logs = final_state.get("test_logs", [])
 
     _write_ground_truth(final_state)
+
+    if chat_logger:
+        chat_logger.write_summary(final_state)
 
     if not logs:
         click.echo(f"✔ All tests passed after {iters} iteration(s).")

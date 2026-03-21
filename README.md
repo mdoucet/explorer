@@ -61,6 +61,9 @@ The `.env` file controls which LLM backend Explorer uses:
 | `EXPLORER_LLM_BASE_URL` | API endpoint URL | `http://localhost:11434` |
 | `EXPLORER_LLM_TEMPERATURE` | Sampling temperature (0.0 = deterministic) | `0.0` |
 | `OPENAI_API_KEY` | Required only when `EXPLORER_LLM_PROVIDER=openai` | — |
+| `LANGCHAIN_TRACING_V2` | Set to `true` to enable LangSmith tracing | — |
+| `LANGCHAIN_API_KEY` | LangSmith API key | — |
+| `LANGCHAIN_PROJECT` | LangSmith project name | `explorer` |
 
 All values can also be overridden via CLI flags (see below).
 
@@ -192,6 +195,55 @@ Key points:
 
 See `skills/quantum-mechanics/SKILL.md` for a complete example.
 
+### Observability
+
+#### Live console output
+
+Explorer streams node-by-node progress to the console as the loop runs:
+
+```
+🔬 Planner
+  Plan preview:
+  │ ## Mathematical Specification
+  │ ...
+💻 Coder
+  Generated 3 file(s):
+  │ src/solver.py  (45 lines)
+  │ tests/test_solver.py  (28 lines)
+✅ Verifier
+  All tests passed (iteration 1)
+```
+
+#### Chat log directory
+
+Use `--chat-dir` to save the full output of every node to disk:
+
+```bash
+explorer run -f task.md --chat-dir chat_output/
+```
+
+This creates numbered Markdown files and a JSON summary:
+
+```
+chat_output/
+├── 00_planner.md
+├── 01_coder.md
+├── 02_verifier.md
+└── summary.json
+```
+
+#### LangSmith tracing
+
+To send traces to [LangSmith](https://smith.langchain.com) for debugging and monitoring, add these to your `.env`:
+
+```bash
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=ls-...
+LANGCHAIN_PROJECT=explorer
+```
+
+When tracing is enabled Explorer auto-sets the project name to `explorer` if not specified.
+
 ### CLI Reference
 
 ```
@@ -210,6 +262,7 @@ Commands:
 | `-f`, `--task-file` | Path to a Markdown file with the task description | — |
 | `-o`, `--output-dir` | Write generated files to this directory (write mode) | — (sandbox) |
 | `-s`, `--skills` | Directories containing skill folders (repeatable) | — |
+| `--chat-dir` | Directory to save the full chat log of the run | — |
 | `--thread-id` | Thread ID for checkpoint persistence | `default` |
 | `--db` | SQLite file for checkpointing | `checkpoints.sqlite` |
 | `--max-iterations` | Maximum plan→code→verify cycles | `50` |
@@ -244,6 +297,7 @@ explorer run -f task.md --thread-id physics_001   # resumes
 |---|---|
 | `ground_truth.md` | Key findings and learnings from the run (written to cwd) |
 | `checkpoints.sqlite` | Persistent graph state for resumption |
+| `chat_output/` | Chat log directory (when `--chat-dir` is used) |
 
 ## Project Structure
 
@@ -267,6 +321,7 @@ explorer/
 │       ├── __init__.py
 │       ├── state.py                   # ScientificState TypedDict + SqliteSaver
 │       ├── nodes.py                   # Planner, Coder, Verifier, Reflector
+│       ├── reporter.py                # Live console reporting & chat logger
 │       └── skills.py                  # Skill loader, matcher, formatter
 └── tests/
     ├── conftest.py                    # Ollama availability fixture
@@ -288,10 +343,12 @@ PYTHONPATH=src python -m pytest tests/ -v -m ollama
 
 ## Design Decisions
 
-- **JAX + NumPy** as numerical backends — JAX preferred for differentiability in physics engines
+- **NumPy + SciPy** as numerical backends
 - **SqliteSaver** checkpointing — simplest local persistence; allows interrupting and resuming long runs
 - **subprocess-based pytest** in the Verifier — sandboxed from the agent process
 - **Skills (Agent Skills spec)** — progressive disclosure of domain knowledge; only matched skills are loaded
+- **LangSmith tracing** — automatic when `LANGCHAIN_TRACING_V2=true` is set; project defaults to `explorer`
+- **Streaming execution** — `app.stream()` instead of `app.invoke()` for real-time node-level reporting
 - **Max 50 iterations** — prevents runaway loops
 - **Type hints everywhere** — Python 3.12+ style annotations (via `from __future__ import annotations`)
 
