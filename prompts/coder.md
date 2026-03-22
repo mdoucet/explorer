@@ -31,11 +31,15 @@ Rules:
   ```py                             ← WRONG (no file path)
 
 Project structure:
-- Use FLAT layout: place the package directory at the project root, NOT
-  inside src/.  Example: my_package/solver.py, NOT src/my_package/solver.py.
+- Use the file paths specified in the plan.  If the plan uses a `src/` layout
+  (e.g. `src/my_package/solver.py`), follow that.  If it uses a flat layout
+  (e.g. `my_package/solver.py`), follow that.  Do NOT mix both layouts.
 - Every package directory MUST have an __init__.py.
 - Test files go in tests/ and import from the package name:
   from my_package.solver import solve  ← CORRECT
-  from src.my_package.solver import solve  ← WRONG
+  from src.my_package.solver import solve  ← WRONG (src is not a package)
+- CRITICAL: When you write BOTH a module and its tests, the test MUST import
+  the EXACT function/class names that the module defines.  Double-check that
+  every name in your test imports exists in the module you wrote above.
 - Do NOT generate conftest.py — the test runner creates it automatically.
 - Always generate a minimal pyproject.toml with [project] and dependencies.

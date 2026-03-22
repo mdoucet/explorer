@@ -552,6 +552,14 @@ def _check_import_consistency(code_drafts: dict[str, str]) -> list[str]:
             if not isinstance(node, ast.ImportFrom) or node.module is None:
                 continue
             mod = node.module
+            # Flag `from src.pkg...` imports — they never work at runtime
+            if mod.startswith("src."):
+                correct = mod.removeprefix("src.")
+                errors.append(
+                    f"Bad import path: {fpath} uses 'from {mod} import ...', "
+                    f"but 'src' is not a package. Use 'from {correct} import ...' instead."
+                )
+                continue
             if mod not in defined:
                 continue
             for alias in node.names:
@@ -563,6 +571,34 @@ def _check_import_consistency(code_drafts: dict[str, str]) -> list[str]:
                         f"'{mod}', but '{mod}' only defines: {available}"
                     )
     return errors
+
+
+def _check_duplicate_modules(code_drafts: dict[str, str]) -> list[str]:
+    """Detect packages that appear in both flat and ``src/`` layouts.
+
+    For example, if *code_drafts* contains both ``pkg/mod.py`` and
+    ``src/pkg/mod.py`` (or even just ``pkg/__init__.py`` and
+    ``src/pkg/__init__.py``), this is almost certainly a mistake that will
+    confuse Python's import system.
+
+    Returns a list of human-readable error strings (empty if no duplicates).
+    """
+    flat_pkgs: set[str] = set()
+    src_pkgs: set[str] = set()
+    for fpath in code_drafts:
+        parts = fpath.split("/")
+        if len(parts) >= 2 and parts[0] == "src":
+            src_pkgs.add(parts[1])
+        elif len(parts) >= 2 and parts[0] != "tests":
+            flat_pkgs.add(parts[0])
+
+    dupes = flat_pkgs & src_pkgs
+    return [
+        f"Duplicate layout: package '{pkg}' exists in both '{pkg}/' (flat) "
+        f"and 'src/{pkg}/' (src layout). Use only ONE layout — remove the "
+        f"duplicate and ensure all imports match the chosen layout."
+        for pkg in sorted(dupes)
+    ]
 
 
 def verifier(state: ScientificState) -> dict[str, Any]:
@@ -581,22 +617,24 @@ def verifier(state: ScientificState) -> dict[str, Any]:
             "iteration_count": state.get("iteration_count", 0) + 1,
         }
 
-    # Quick import consistency check before running pytest
-    import_errors = _check_import_consistency(code_drafts)
+    # Quick structural and import checks before running pytest
+    pre_errors = _check_duplicate_modules(code_drafts)
+    if not pre_errors:
+        pre_errors = _check_import_consistency(code_drafts)
 
     output_dir = state.get("output_dir", "")
 
     if output_dir:
         # Write mode — run pytest in the real output directory
         root = Path(output_dir).resolve()
-        logs = import_errors or _run_pytest(root)
+        logs = pre_errors or _run_pytest(root)
     else:
         # Sandbox mode — temp dir with auto-cleanup
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             _prepare_sandbox(root, code_drafts)
             print(f"[explorer] Sandbox directory: {root}")
-            logs = import_errors or _run_pytest(root)
+            logs = pre_errors or _run_pytest(root)
 
     return {
         "test_logs": logs,

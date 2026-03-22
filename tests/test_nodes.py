@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from orchestrator.nodes import (
+    _check_duplicate_modules,
     _check_import_consistency,
     _extract_signatures,
     _looks_like_filepath,
@@ -360,17 +361,16 @@ class TestWriteCodeDrafts:
 class TestVerifierWriteMode:
     def test_runs_pytest_in_output_dir(self, tmp_path: Path) -> None:
         """Verifier runs pytest in the output directory, not a temp dir."""
-        # Pre-write code into the output directory
-        (tmp_path / "src" / "math").mkdir(parents=True)
-        (tmp_path / "src" / "math" / "factorial.py").write_text(
+        # Pre-write code into the output directory (flat layout)
+        (tmp_path / "mymath").mkdir()
+        (tmp_path / "mymath" / "__init__.py").write_text("")
+        (tmp_path / "mymath" / "factorial.py").write_text(
             "def factorial(n: int) -> int:\n"
             "    return 1 if n <= 1 else n * factorial(n - 1)\n"
         )
         (tmp_path / "tests").mkdir()
         (tmp_path / "tests" / "test_factorial.py").write_text(
-            "import sys, pathlib\n"
-            "sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))\n"
-            "from src.math.factorial import factorial\n"
+            "from mymath.factorial import factorial\n"
             "def test_base():\n"
             "    assert factorial(0) == 1\n"
         )
@@ -381,14 +381,13 @@ class TestVerifierWriteMode:
 
         state = _base_state(
             code_drafts={
-                "src/math/factorial.py": (
+                "mymath/__init__.py": "",
+                "mymath/factorial.py": (
                     "def factorial(n: int) -> int:\n"
                     "    return 1 if n <= 1 else n * factorial(n - 1)\n"
                 ),
                 "tests/test_factorial.py": (
-                    "import sys, pathlib\n"
-                    "sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))\n"
-                    "from src.math.factorial import factorial\n"
+                    "from mymath.factorial import factorial\n"
                     "def test_base():\n"
                     "    assert factorial(0) == 1\n"
                 ),
@@ -696,10 +695,20 @@ class TestCheckImportConsistency:
         }
         assert _check_import_consistency(drafts) == []
 
-
-# ---------------------------------------------------------------------------
-# advance_phase clears ground_truth
-# ---------------------------------------------------------------------------
+    def test_detects_src_prefix_import(self) -> None:
+        """Imports like `from src.pkg.mod import X` should be flagged."""
+        drafts = {
+            "src/square_well/solver.py": "def find_bound_states() -> list:\n    pass\n",
+            "tests/test_solver.py": (
+                "from src.square_well.solver import find_bound_states\n"
+                "def test_it():\n    find_bound_states()\n"
+            ),
+        }
+        errors = _check_import_consistency(drafts)
+        assert len(errors) == 1
+        assert "src" in errors[0]
+        assert "not a package" in errors[0]
+        assert "square_well.solver" in errors[0]
 
 class TestAdvancePhaseGroundTruth:
     def test_clears_ground_truth_on_advance(
@@ -718,3 +727,46 @@ class TestAdvancePhaseGroundTruth:
         result = advance_phase(state)
 
         assert result["ground_truth"] == []
+
+
+# ---------------------------------------------------------------------------
+# _check_duplicate_modules
+# ---------------------------------------------------------------------------
+
+class TestCheckDuplicateModules:
+    def test_no_duplicates_flat_layout(self) -> None:
+        drafts = {
+            "my_pkg/__init__.py": "",
+            "my_pkg/solver.py": "def solve(): pass\n",
+            "tests/test_solver.py": "def test_it(): pass\n",
+        }
+        assert _check_duplicate_modules(drafts) == []
+
+    def test_no_duplicates_src_layout(self) -> None:
+        drafts = {
+            "src/my_pkg/__init__.py": "",
+            "src/my_pkg/solver.py": "def solve(): pass\n",
+            "tests/test_solver.py": "def test_it(): pass\n",
+        }
+        assert _check_duplicate_modules(drafts) == []
+
+    def test_detects_duplicate_layout(self) -> None:
+        drafts = {
+            "square_well/__init__.py": "",
+            "square_well/solver.py": "def solve(): pass\n",
+            "src/square_well/__init__.py": "",
+            "src/square_well/solver.py": "def solve(): pass\n",
+            "tests/test_solver.py": "def test_it(): pass\n",
+        }
+        errors = _check_duplicate_modules(drafts)
+        assert len(errors) == 1
+        assert "square_well" in errors[0]
+        assert "Duplicate layout" in errors[0]
+
+    def test_ignores_tests_directory(self) -> None:
+        """tests/ should not be flagged as a flat-layout package."""
+        drafts = {
+            "src/my_pkg/__init__.py": "",
+            "tests/test_solver.py": "def test_it(): pass\n",
+        }
+        assert _check_duplicate_modules(drafts) == []

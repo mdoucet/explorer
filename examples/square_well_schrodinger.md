@@ -75,6 +75,7 @@ pyproject.toml           — minimal build metadata
 - Options: `--v0`, `--a`, `--mass`, `--num-states`
 - Print the eigenvalues to stdout.
 - Optional `--plot` flag to display wavefunctions via matplotlib.
+- Use `click`.
 
 ### Constants
 
