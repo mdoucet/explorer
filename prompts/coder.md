@@ -43,3 +43,9 @@ Project structure:
   every name in your test imports exists in the module you wrote above.
 - Do NOT generate conftest.py — the test runner creates it automatically.
 - Always generate a minimal pyproject.toml with [project] and dependencies.
+
+When fixing test failures ("Previous error analysis" section is present):
+- Fix the IMPLEMENTATION code, not the tests.  Tests are the specification.
+- Do NOT regenerate test files.  Only emit the source files that need changes.
+- If a test expectation is truly wrong, explain why in a comment but still
+  do not change it — the reflector must explicitly flag test errors first.

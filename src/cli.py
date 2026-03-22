@@ -77,7 +77,7 @@ def build_graph(max_iterations: int = MAX_ITERATIONS) -> StateGraph:
         _make_should_continue(max_iterations),
         {"reflect": "reflector", "advance_phase": "advance_phase", "end": END},
     )
-    graph.add_edge("reflector", "planner")
+    graph.add_edge("reflector", "coder")
     graph.add_edge("advance_phase", "coder")
 
     return graph

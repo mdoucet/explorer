@@ -556,30 +556,24 @@ class TestPlannerPhases:
         assert "Build solver" in result["plan"]
         assert (tmp_path / "plan.md").exists()
 
-    def test_planner_revision_updates_current_phase_only(
+    def test_planner_ignores_reflection_context(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
+        """The planner always generates a fresh plan — it no longer handles
+        revision loops (the reflector routes directly to the coder)."""
         monkeypatch.chdir(tmp_path)
-        existing_phases = [
-            {"id": 1, "title": "Core", "description": "original", "status": "completed", "files": []},
-            {"id": 2, "title": "CLI", "description": "original cli", "status": "pending", "files": []},
-        ]
-        revised_output = "## Phase 1: Revised CLI\nFixed the CLI.\nFiles: cli.py\n"
-        fake = _FakeLLM(revised_output)
+        plan_output = "## Phase 1: Core\nBuild the core.\nFiles: core.py\n"
+        fake = _FakeLLM(plan_output)
         monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
 
         state = _base_state(
             reflection="ImportError in cli.py",
-            plan_phases=existing_phases,
-            current_phase=1,
         )
         result = planner(state)
 
-        # Phase 1 (Core) should be untouched
-        assert result["plan_phases"][0]["description"] == "original"
-        # Phase 2 (CLI) should be revised
-        assert "Fixed the CLI" in result["plan_phases"][1]["description"]
-        assert result["current_phase"] == 1
+        # Reflection should NOT appear in the planner prompt
+        assert "ImportError" not in result["_prompt_summary"]
+        assert result["current_phase"] == 0
 
 
 class TestAdvancePhase:
@@ -931,6 +925,52 @@ class TestCoderErrorContext:
         prompt_sent = result["_prompt_summary"]
         assert "CRITICAL" in prompt_sent
         assert "4 consecutive iterations" in prompt_sent
+
+    def test_revision_protects_existing_test_files(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """On revision iterations (reflection is set), existing test files
+        must not be overwritten even if the coder emits them."""
+        # The coder emits both solver.py and test_solver.py
+        llm_output = (
+            "```solver.py\ndef solve(): return 42\n```\n\n"
+            "```tests/test_solver.py\nassert False  # rewritten tests\n```\n"
+        )
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        original_test = "from solver import solve\ndef test_it(): assert solve() == 42\n"
+        state = _base_state(
+            plan="fix solver",
+            reflection="Return value is wrong.",
+            code_drafts={
+                "solver.py": "def solve(): return -1\n",
+                "tests/test_solver.py": original_test,
+            },
+        )
+        result = coder(state)
+
+        # Implementation should be updated
+        assert "return 42" in result["code_drafts"]["solver.py"]
+        # Test file should be PROTECTED (original preserved)
+        assert result["code_drafts"]["tests/test_solver.py"] == original_test
+
+    def test_first_iteration_allows_test_files(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """On the first iteration (no reflection), test files should be kept."""
+        llm_output = (
+            "```solver.py\ndef solve(): return 42\n```\n\n"
+            "```tests/test_solver.py\nfrom solver import solve\ndef test_it(): assert solve() == 42\n```\n"
+        )
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(plan="implement solver")
+        result = coder(state)
+
+        assert "tests/test_solver.py" in result["code_drafts"]
+        assert "assert solve() == 42" in result["code_drafts"]["tests/test_solver.py"]
 
 
 # ---------------------------------------------------------------------------

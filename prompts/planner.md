@@ -34,9 +34,4 @@ Rules for phasing:
 - Do NOT include full code implementations in the plan.  List function
   signatures (name + parameters) and their purpose only.
 
-If you are revising a plan after an error (the "Previous error analysis"
-section is present), focus your changes on the CURRENT phase only — do NOT
-restructure later phases.  Do not repeat working code — describe only what
-needs to change.
-
 Reply in Markdown.

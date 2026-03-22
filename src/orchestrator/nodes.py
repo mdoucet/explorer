@@ -169,20 +169,13 @@ def _write_plan_artifact(phases: list[dict[str, Any]], current: int) -> None:
 def planner(state: ScientificState) -> dict[str, Any]:
     """Analyse the task and produce a phased implementation plan.
 
-    On the first call the planner generates a full multi-phase plan.
-    On subsequent calls (reflection loop) it revises only the current phase.
-    The full plan and its current phase are returned so that downstream
-    nodes always receive structured phase information.
+    The planner runs once at the start (and again when advancing phases).
+    On error loops the reflector feeds directly back to the coder, so the
+    planner is not invoked during revision iterations.
     """
     llm = get_llm()
 
-    # Detect whether this is a revision (reflection loop) or a fresh plan
-    existing_phases: list[dict[str, Any]] = list(state.get("plan_phases") or [])
-    is_revision = bool(state.get("reflection")) and bool(existing_phases)
-
     user_parts: list[str] = [f"## Task\n{state['task_description']}"]
-    if state.get("reflection"):
-        user_parts.append(f"## Previous error analysis\n{state['reflection']}")
     if state.get("mathematical_constants"):
         user_parts.append(
             f"## Constants\n{state['mathematical_constants']}"
@@ -199,21 +192,8 @@ def planner(state: ScientificState) -> dict[str, Any]:
 
     raw_plan = response.content
 
-    if is_revision:
-        # Only update the current phase's description; keep the rest intact
-        current_idx = state.get("current_phase", 0)
-        revised_phases = _parse_plan_phases(raw_plan)
-        # Use the first revised phase to update the current one
-        if revised_phases:
-            existing_phases[current_idx]["description"] = revised_phases[0]["description"]
-            if revised_phases[0]["files"]:
-                existing_phases[current_idx]["files"] = revised_phases[0]["files"]
-        plan_phases = existing_phases
-        current_phase = current_idx
-    else:
-        # Fresh plan: parse all phases
-        plan_phases = _parse_plan_phases(raw_plan)
-        current_phase = 0
+    plan_phases = _parse_plan_phases(raw_plan)
+    current_phase = 0
 
     # Set `plan` to the current phase description for backward compatibility
     plan_text = plan_phases[current_phase]["description"]
@@ -387,6 +367,17 @@ def coder(state: ScientificState) -> dict[str, Any]:
 
     raw_content = response.content
     new_drafts = _parse_code_blocks(raw_content)
+
+    # On revision iterations (reflector → coder), protect existing test files.
+    # The coder should fix the implementation, not rewrite the test expectations.
+    is_revision = bool(state.get("reflection"))
+    if is_revision and existing_drafts:
+        protected = {
+            fp for fp in existing_drafts
+            if fp.rpartition("/")[2].startswith("test_")
+        }
+        for fp in protected:
+            new_drafts.pop(fp, None)
 
     # Merge new drafts into accumulated drafts (new files override old)
     merged_drafts = dict(existing_drafts)

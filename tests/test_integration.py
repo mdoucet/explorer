@@ -23,20 +23,20 @@ _PLAN_RESPONSE = """\
 n! = \\prod_{k=1}^{n} k
 ```
 
-## File-tree
-- `src/math/factorial.py` — recursive factorial implementation
-- `tests/test_factorial.py` — unit tests
+## Phase 1: Factorial
+Implement a recursive factorial function with tests.
+Files: factorial.py, tests/test_factorial.py
 """
 
 _CODE_RESPONSE = """\
-```src/math/factorial.py
+```factorial.py
 def factorial(n: int) -> int:
     \"\"\"Compute $n!$ recursively.\"\"\"
     return 1 if n <= 1 else n * factorial(n - 1)
 ```
 
 ```tests/test_factorial.py
-from src.math.factorial import factorial
+from factorial import factorial
 
 def test_base():
     assert factorial(0) == 1
@@ -93,7 +93,7 @@ class TestFullLoopSuccess:
 
         assert final["iteration_count"] == 1
         assert final["test_logs"] == []
-        assert "src/math/factorial.py" in final["code_drafts"]
+        assert "factorial.py" in final["code_drafts"]
 
 
 class TestLoopReflectsOnFailure:
@@ -101,13 +101,13 @@ class TestLoopReflectsOnFailure:
 
     def test_reflects_then_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
         bad_code = """\
-```src/math/factorial.py
+```factorial.py
 def factorial(n: int) -> int:
     return -1
 ```
 
 ```tests/test_factorial.py
-from src.math.factorial import factorial
+from factorial import factorial
 
 def test_five():
     assert factorial(5) == 120
@@ -116,13 +116,13 @@ def test_five():
         reflection = "The function returns a hardcoded -1 instead of computing the factorial."
         findings = "- The coder produced a stub instead of real logic"
 
-        # Sequence: plan → bad code → reflection → findings → revised plan → good code
+        # Sequence: plan → bad code → reflection → findings → good code
+        # (reflector routes directly to coder, skipping the planner on revision)
         fake = _SequenceLLM([
             _PLAN_RESPONSE,   # planner #1
             bad_code,          # coder #1 (will fail)
             reflection,        # reflector (reflection)
             findings,          # reflector (findings extraction)
-            _PLAN_RESPONSE,   # planner #2
             _CODE_RESPONSE,   # coder #2 (will pass)
         ])
         monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
