@@ -257,18 +257,23 @@ def run(task: str | None, task_file: str | None, thread_id: str, db: str,
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     # Load and match skills (progressive disclosure)
-    skills_context = ""
-    if skills:
-        from orchestrator.skills import load_skills, match_skills, format_skills_context
+    # Always include the built-in skills/ directory shipped with the project
+    from orchestrator.skills import load_skills, match_skills, format_skills_context
 
-        all_skills = load_skills(list(skills))
-        matched = match_skills(all_skills, task)
-        if matched:
-            skills_context = format_skills_context(matched)
-            click.echo(f"📚 Matched {len(matched)} skill(s): "
-                       f"{', '.join(s.name for s in matched)}")
-        else:
-            click.echo(f"📚 Loaded {len(all_skills)} skill(s), none matched the task.")
+    builtin_skills_dir = Path(__file__).resolve().parent.parent / "skills"
+    skill_dirs = list(skills)
+    if builtin_skills_dir.is_dir() and str(builtin_skills_dir) not in skill_dirs:
+        skill_dirs.insert(0, str(builtin_skills_dir))
+
+    skills_context = ""
+    all_skills = load_skills(skill_dirs)
+    matched = match_skills(all_skills, task)
+    if matched:
+        skills_context = format_skills_context(matched)
+        click.echo(f"📚 Matched {len(matched)} skill(s): "
+                   f"{', '.join(s.name for s in matched)}")
+    elif all_skills:
+        click.echo(f"📚 Loaded {len(all_skills)} skill(s), none matched the task.")
 
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 2**31}
 

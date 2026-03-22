@@ -518,6 +518,50 @@ def _prepare_sandbox(root: Path, code_drafts: dict[str, str]) -> None:
     )
 
 
+def _ensure_importable(root: Path, code_drafts: dict[str, str]) -> None:
+    """Make sure ``import pkg`` works when running pytest in *root*.
+
+    Unlike ``_prepare_sandbox``, files already exist on disk (write mode).
+    This function only does the import-plumbing step:
+    1. ``pip install -e .`` if a pyproject.toml exists.
+    2. Otherwise generate a ``conftest.py`` with ``sys.path`` entries.
+    """
+    if (root / "pyproject.toml").exists():
+        pip_result = subprocess.run(  # noqa: S603
+            ["python", "-m", "pip", "install", "-e", str(root),
+             "--no-build-isolation", "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(root),
+        )
+        if pip_result.returncode == 0:
+            return
+
+    # Fallback: conftest-based sys.path manipulation
+    if (root / "conftest.py").exists():
+        return
+
+    path_roots: set[str] = set()
+    path_roots.add(str(root))
+    if (root / "src").is_dir():
+        path_roots.add(str(root / "src"))
+    for init in root.rglob("__init__.py"):
+        pkg_dir = init.parent
+        while (pkg_dir.parent / "__init__.py").exists():
+            pkg_dir = pkg_dir.parent
+        path_roots.add(str(pkg_dir.parent))
+
+    path_lines = "\n".join(
+        f'    sys.path.insert(0, {p!r})' for p in sorted(path_roots)
+    )
+    (root / "conftest.py").write_text(
+        "import sys\n\n\n"
+        "def pytest_configure(config):\n"
+        f"{path_lines}\n"
+    )
+
+
 def _check_import_consistency(code_drafts: dict[str, str]) -> list[str]:
     """Check that names imported in test files are actually defined in source modules.
 
@@ -646,6 +690,7 @@ def verifier(state: ScientificState) -> dict[str, Any]:
     if output_dir:
         # Write mode — run pytest in the real output directory
         root = Path(output_dir).resolve()
+        _ensure_importable(root, code_drafts)
         logs = pre_errors or _run_pytest(root)
     else:
         # Sandbox mode — temp dir with auto-cleanup

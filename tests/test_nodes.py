@@ -11,6 +11,7 @@ import pytest
 from orchestrator.nodes import (
     _check_duplicate_modules,
     _check_import_consistency,
+    _ensure_importable,
     _extract_signatures,
     _looks_like_filepath,
     _parse_code_blocks,
@@ -398,10 +399,80 @@ class TestVerifierWriteMode:
         assert result["test_logs"] == []
         assert result["iteration_count"] == 1
 
+    def test_src_layout_works_in_write_mode(self, tmp_path: Path) -> None:
+        """Write mode with src/ layout: _ensure_importable generates conftest."""
+        # Prepare src layout on disk
+        (tmp_path / "src" / "mymath").mkdir(parents=True)
+        (tmp_path / "src" / "mymath" / "__init__.py").write_text("")
+        (tmp_path / "src" / "mymath" / "factorial.py").write_text(
+            "def factorial(n: int) -> int:\n"
+            "    return 1 if n <= 1 else n * factorial(n - 1)\n"
+        )
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_factorial.py").write_text(
+            "from mymath.factorial import factorial\n"
+            "def test_base():\n"
+            "    assert factorial(0) == 1\n"
+        )
+
+        state = _base_state(
+            code_drafts={
+                "src/mymath/__init__.py": "",
+                "src/mymath/factorial.py": (
+                    "def factorial(n: int) -> int:\n"
+                    "    return 1 if n <= 1 else n * factorial(n - 1)\n"
+                ),
+                "tests/test_factorial.py": (
+                    "from mymath.factorial import factorial\n"
+                    "def test_base():\n"
+                    "    assert factorial(0) == 1\n"
+                ),
+            },
+            output_dir=str(tmp_path),
+        )
+        result = verifier(state)
+        assert result["test_logs"] == []
+
 
 # ---------------------------------------------------------------------------
-# Plan phase parsing
+# _ensure_importable
 # ---------------------------------------------------------------------------
+
+class TestEnsureImportable:
+    def test_generates_conftest_for_src_layout(self, tmp_path: Path) -> None:
+        """When pip install fails or no pyproject.toml, conftest is generated."""
+        (tmp_path / "src" / "pkg").mkdir(parents=True)
+        (tmp_path / "src" / "pkg" / "__init__.py").write_text("")
+        (tmp_path / "src" / "pkg" / "mod.py").write_text("X = 1\n")
+
+        _ensure_importable(tmp_path, {
+            "src/pkg/__init__.py": "",
+            "src/pkg/mod.py": "X = 1\n",
+        })
+
+        conftest = (tmp_path / "conftest.py").read_text()
+        assert "sys.path" in conftest
+        assert "src" in conftest
+
+    def test_does_not_overwrite_existing_conftest(self, tmp_path: Path) -> None:
+        """If a conftest.py already exists, _ensure_importable leaves it alone."""
+        (tmp_path / "conftest.py").write_text("# custom conftest\n")
+        (tmp_path / "src" / "pkg").mkdir(parents=True)
+        (tmp_path / "src" / "pkg" / "__init__.py").write_text("")
+
+        _ensure_importable(tmp_path, {"src/pkg/__init__.py": ""})
+
+        assert (tmp_path / "conftest.py").read_text() == "# custom conftest\n"
+
+    def test_flat_layout_includes_root(self, tmp_path: Path) -> None:
+        """Flat layout: conftest includes the project root."""
+        (tmp_path / "pkg").mkdir()
+        (tmp_path / "pkg" / "__init__.py").write_text("")
+
+        _ensure_importable(tmp_path, {"pkg/__init__.py": ""})
+
+        conftest = (tmp_path / "conftest.py").read_text()
+        assert str(tmp_path) in conftest
 
 class TestParsePlanPhases:
     """Tests for _parse_plan_phases."""
