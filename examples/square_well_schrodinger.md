@@ -96,3 +96,5 @@ Use atomic units throughout:
    equations to within $10^{-6}$ relative error.
 4. Wavefunctions must be normalised: $\left|\int |\psi|^2 dx - 1\right| < 10^{-4}$.
 5. The CLI must print eigenvalues when invoked with `--v0 50 --a 1`.
+6. Review function calls and make sure function signatures are consistent.
+7. Test all equations for edge cases that would lead to issues, like divide by zero.

@@ -12,16 +12,23 @@ A LangGraph-based agentic framework for autonomous scientific Python development
      │         ┌───────────┐         │
      └─────────│ Reflector │◀────────┘
                └───────────┘    (on failure)
+                                     │
+                              ┌──────────────┐
+                              │ AdvancePhase │  (on pass,
+                              └──────┬───────┘   more phases)
+                                     │
+                                     └──▶ Coder
 ```
 
 | Node | Role |
 |---|---|
-| **Planner** | Analyses the task and produces a LaTeX-formatted mathematical spec + file-tree plan |
-| **Coder** | Generates Python source files from the plan (type-hinted, with LaTeX docstrings) |
-| **Verifier** | Runs `pytest` against the generated code — in a sandboxed temp dir (default) or directly in the output directory (write mode) |
-| **Reflector** | Analyses test failures and feeds error context back to the Planner |
+| **Planner** | Analyses the task and produces a LaTeX-formatted mathematical spec + multi-phase implementation plan |
+| **Coder** | Generates Python source files for the current phase (type-hinted, with LaTeX docstrings). Receives function signatures from prior-phase code for import consistency |
+| **Verifier** | Runs import consistency checks and duplicate-layout detection, then `pytest` — in a sandboxed temp dir (default) or directly in the output directory (write mode) |
+| **Reflector** | Analyses test failures, extracts key findings, and feeds error context back to the Planner |
+| **AdvancePhase** | Marks the current phase as completed, clears stale reflection and ground truth, and advances to the next phase |
 
-The loop terminates when all tests pass or after a configurable number of iterations (default: 50).
+The loop terminates when all tests pass in the final phase, or after a configurable number of iterations (default: unlimited).
 
 ## Requirements
 
@@ -252,6 +259,7 @@ explorer [OPTIONS] COMMAND [ARGS]...
 Commands:
   run        Run the Scientific Loop agent on a task
   check-llm  Check connectivity to the configured LLM endpoint
+  status     Show the state of a checkpointed run
 ```
 
 #### `explorer run`
@@ -263,9 +271,10 @@ Commands:
 | `-o`, `--output-dir` | Write generated files to this directory (write mode) | — (sandbox) |
 | `-s`, `--skills` | Directories containing skill folders (repeatable) | — |
 | `--chat-dir` | Directory to save the full chat log of the run | — |
-| `--thread-id` | Thread ID for checkpoint persistence | `default` |
+| `-r`, `--resume` | Resume a previous run from its checkpoint (requires `--thread-id`) | — |
+| `--thread-id` | Thread ID for checkpoint persistence | random |
 | `--db` | SQLite file for checkpointing | `checkpoints.sqlite` |
-| `--max-iterations` | Maximum plan→code→verify cycles | `50` |
+| `--max-iterations` | Maximum plan→code→verify cycles (0 = unlimited) | `0` |
 | `--provider` | LLM provider (`ollama` or `openai`) | env / `ollama` |
 | `--model` | Model name | env / `qwen2.5-coder:32b` |
 | `--base-url` | LLM API base URL | env |
@@ -281,21 +290,37 @@ Provide either `--task` or `--task-file`, not both.
 | `--model` | Model name | env / `qwen2.5-coder:32b` |
 | `--base-url` | LLM API base URL | env |
 
+#### `explorer status`
+
+Show the state of a checkpointed run:
+
+```bash
+explorer status --thread-id physics_001
+```
+
+| Flag | Description | Default |
+|---|---|---|
+| `--thread-id` | Thread ID to inspect | `default` |
+| `--db` | SQLite file for checkpointing | `checkpoints.sqlite` |
+
 ### Checkpointing and resumption
 
-Explorer persists graph state to a local SQLite database. If a run is interrupted, re-run the same command with the same `--thread-id` to resume from the last checkpoint:
+Explorer persists graph state to a local SQLite database. If a run is interrupted, use `--resume` with the same `--thread-id` to pick up where it left off:
 
 ```bash
 explorer run -f task.md --thread-id physics_001
 # (interrupted)
-explorer run -f task.md --thread-id physics_001   # resumes
+explorer run -f task.md --thread-id physics_001 --resume   # resumes
 ```
+
+Resume loads the full accumulated state (code drafts, iteration count, phase progress, plan) from the checkpoint and restarts the graph from the planner with all that context intact.
 
 ### Output artifacts
 
 | File | Description |
 |---|---|
 | `ground_truth.md` | Key findings and learnings from the run (written to cwd) |
+| `plan.md` | Phased plan with status checkmarks (written to cwd) |
 | `checkpoints.sqlite` | Persistent graph state for resumption |
 | `chat_output/` | Chat log directory (when `--chat-dir` is used) |
 
@@ -320,12 +345,13 @@ explorer/
 │   └── orchestrator/
 │       ├── __init__.py
 │       ├── state.py                   # ScientificState TypedDict + SqliteSaver
-│       ├── nodes.py                   # Planner, Coder, Verifier, Reflector
+│       ├── nodes.py                   # Planner, Coder, Verifier, Reflector, AdvancePhase
 │       ├── reporter.py                # Live console reporting & chat logger
 │       └── skills.py                  # Skill loader, matcher, formatter
 └── tests/
     ├── conftest.py                    # Ollama availability fixture
     ├── test_nodes.py                  # Unit tests per node (mocked LLM)
+    ├── test_reporter.py               # Chat logger and reporting tests
     ├── test_skills.py                 # Skill loading and matching tests
     ├── test_integration.py            # Full-loop graph tests (mocked LLM)
     └── test_e2e_schrodinger.py        # End-to-end test with real Ollama
@@ -349,7 +375,7 @@ PYTHONPATH=src python -m pytest tests/ -v -m ollama
 - **Skills (Agent Skills spec)** — progressive disclosure of domain knowledge; only matched skills are loaded
 - **LangSmith tracing** — automatic when `LANGCHAIN_TRACING_V2=true` is set; project defaults to `explorer`
 - **Streaming execution** — `app.stream()` instead of `app.invoke()` for real-time node-level reporting
-- **Max 50 iterations** — prevents runaway loops
+- **Unlimited iterations by default** — set `--max-iterations` to cap; multi-phase plans advance automatically
 - **Type hints everywhere** — Python 3.12+ style annotations (via `from __future__ import annotations`)
 
 ## License
