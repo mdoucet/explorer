@@ -592,6 +592,8 @@ def _check_import_consistency(code_drafts: dict[str, str]) -> list[str]:
                 for t in node.targets:
                     if isinstance(t, ast.Name):
                         names.add(t.id)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
         # Convert file path to dotted module path
         mod_path = fpath.removesuffix(".py").replace("/", ".")
         # Also store without leading "src." for src-layout projects

@@ -75,3 +75,11 @@ Key findings and verified facts discovered during development.
 - **Root cause 2 — Skills never loaded:** The `python-testing` skill (which teaches the coder flat layout, correct imports, etc.) was only loaded when the user passed `--skills skills/`. Most runs omitted this flag, so the skill never fired.
 - **Fix 2 — Auto-load built-in skills:** The CLI now always includes the project's `skills/` directory (next to `src/`) in the skill search path. User-supplied `--skills` directories are additive. This ensures `python-testing` and other built-in skills always match when relevant.
 - **Test count:** 4 new tests (3 `_ensure_importable`, 1 write-mode src-layout verifier). Total: 98 unit tests passing.
+
+## Import Consistency: `ast.AnnAssign` (Typed Assignments)
+
+- **Problem observed:** In a live run (schrodinger-qwen, Qwen 3.5 122B), the agent got stuck for 20+ iterations because `_check_import_consistency()` reported "Import mismatch: only defines: (nothing)" for a `constants.py` file that used `typing.Final` annotations (e.g. `HBAR: Final[float] = 1.0545718e-34`).
+- **Root cause:** `_check_import_consistency()` only recognized `ast.Assign` nodes (plain assignments like `PI = 3.14`). Typed/annotated assignments (`HBAR: Final[float] = 1.0`) produce `ast.AnnAssign` nodes in the AST, which were silently ignored. The checker thought the module defined nothing, causing every import from it to fail the consistency check.
+- **Fix:** Added `ast.AnnAssign` handling after the existing `ast.Assign` block: `elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name): names.add(node.target.id)`. Note: `ast.AnnAssign.target` is a single `ast.Name` (not a list like `ast.Assign.targets`).
+- **Not changed:** `_extract_signatures()` was not modified — it extracts function/class signatures for coder context, and constants don't need signature extraction.
+- **Test count:** 1 new test (`test_annotated_assignment_counted`). Total: 99 unit tests passing.

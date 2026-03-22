@@ -766,6 +766,21 @@ class TestCheckImportConsistency:
         }
         assert _check_import_consistency(drafts) == []
 
+    def test_annotated_assignment_counted(self) -> None:
+        """Typed assignments like `X: Final[float] = 1.0` must be recognized."""
+        drafts = {
+            "constants.py": (
+                "from typing import Final\n"
+                "HBAR: Final[float] = 1.0545718e-34\n"
+                "PI: Final[float] = 3.14159\n"
+            ),
+            "tests/test_constants.py": (
+                "from constants import HBAR, PI\n"
+                "def test_hbar():\n    assert HBAR > 0\n"
+            ),
+        }
+        assert _check_import_consistency(drafts) == []
+
     def test_detects_src_prefix_import(self) -> None:
         """Imports like `from src.pkg.mod import X` should be flagged."""
         drafts = {
