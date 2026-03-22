@@ -770,3 +770,238 @@ class TestCheckDuplicateModules:
             "tests/test_solver.py": "def test_it(): pass\n",
         }
         assert _check_duplicate_modules(drafts) == []
+
+
+# ---------------------------------------------------------------------------
+# Coder receives error context
+# ---------------------------------------------------------------------------
+
+class TestCoderErrorContext:
+    """The coder should include reflection and test_logs in its prompt when
+    they are non-empty (i.e. after a failed verify→reflect cycle)."""
+
+    def test_includes_reflection_in_prompt(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        llm_output = "```pkg/mod.py\nx = 1\n```\n"
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(
+            plan="implement constants",
+            reflection="Define HBAR at module level, not inside get_constants().",
+        )
+        result = coder(state)
+
+        prompt_sent = result["_prompt_summary"]
+        assert "Previous error analysis" in prompt_sent
+        assert "HBAR" in prompt_sent
+
+    def test_includes_test_logs_in_prompt(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        llm_output = "```pkg/mod.py\nx = 1\n```\n"
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(
+            plan="fix imports",
+            test_logs=["Import mismatch: tests/test_c.py imports 'HBAR'"],
+        )
+        result = coder(state)
+
+        prompt_sent = result["_prompt_summary"]
+        assert "Test failures to fix" in prompt_sent
+        assert "Import mismatch" in prompt_sent
+
+    def test_no_error_context_on_first_iteration(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        llm_output = "```pkg/mod.py\nx = 1\n```\n"
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(plan="implement something")
+        result = coder(state)
+
+        prompt_sent = result["_prompt_summary"]
+        assert "Previous error analysis" not in prompt_sent
+        assert "Test failures to fix" not in prompt_sent
+
+    def test_critical_escalation_after_3_repeats(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        llm_output = "```pkg/mod.py\nx = 1\n```\n"
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(
+            plan="fix imports",
+            reflection="Constants must be at module level.",
+            _error_repeat_count=4,
+        )
+        result = coder(state)
+
+        prompt_sent = result["_prompt_summary"]
+        assert "CRITICAL" in prompt_sent
+        assert "4 consecutive iterations" in prompt_sent
+
+
+# ---------------------------------------------------------------------------
+# Stuck-loop detection in verifier
+# ---------------------------------------------------------------------------
+
+class TestStuckLoopDetection:
+    """Verifier tracks consecutive identical error fingerprints."""
+
+    def test_first_failure_sets_count_to_one(self) -> None:
+        state = _base_state(
+            code_drafts={
+                "pkg/__init__.py": "",
+                "pkg/mod.py": "def solve(): pass\n",
+                "tests/test_mod.py": (
+                    "from pkg.mod import MISSING\n"
+                    "def test_it(): pass\n"
+                ),
+            },
+        )
+        result = verifier(state)
+
+        assert result["_error_repeat_count"] == 1
+        assert result["_prev_error_fingerprint"] != ""
+
+    def test_same_error_increments_count(self) -> None:
+        drafts = {
+            "pkg/__init__.py": "",
+            "pkg/mod.py": "def solve(): pass\n",
+            "tests/test_mod.py": (
+                "from pkg.mod import MISSING\n"
+                "def test_it(): pass\n"
+            ),
+        }
+        # Run once to get the fingerprint
+        state1 = _base_state(code_drafts=drafts)
+        r1 = verifier(state1)
+
+        # Run again with the same error and prior fingerprint
+        state2 = _base_state(
+            code_drafts=drafts,
+            _prev_error_fingerprint=r1["_prev_error_fingerprint"],
+            _error_repeat_count=r1["_error_repeat_count"],
+        )
+        r2 = verifier(state2)
+
+        assert r2["_error_repeat_count"] == 2
+
+    def test_different_error_resets_count(self) -> None:
+        drafts_a = {
+            "pkg/__init__.py": "",
+            "pkg/mod.py": "def solve(): pass\n",
+            "tests/test_mod.py": (
+                "from pkg.mod import MISSING_A\n"
+                "def test_it(): pass\n"
+            ),
+        }
+        drafts_b = {
+            "pkg/__init__.py": "",
+            "pkg/mod.py": "def solve(): pass\n",
+            "tests/test_mod.py": (
+                "from pkg.mod import MISSING_B\n"
+                "def test_it(): pass\n"
+            ),
+        }
+        r1 = verifier(_base_state(code_drafts=drafts_a))
+
+        state2 = _base_state(
+            code_drafts=drafts_b,
+            _prev_error_fingerprint=r1["_prev_error_fingerprint"],
+            _error_repeat_count=r1["_error_repeat_count"],
+        )
+        r2 = verifier(state2)
+
+        assert r2["_error_repeat_count"] == 1  # reset, not 2
+
+    def test_passing_tests_reset_count(self) -> None:
+        state = _base_state(
+            code_drafts={
+                "pkg/__init__.py": "",
+                "pkg/mod.py": "def solve(): pass\n",
+                "tests/test_mod.py": (
+                    "from pkg.mod import solve\n"
+                    "def test_it():\n"
+                    "    assert solve() is None\n"
+                ),
+            },
+            _prev_error_fingerprint="old-fp",
+            _error_repeat_count=5,
+        )
+        result = verifier(state)
+
+        assert result["_error_repeat_count"] == 0
+        assert result["_prev_error_fingerprint"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Ground truth deduplication
+# ---------------------------------------------------------------------------
+
+class TestGroundTruthDedup:
+    """Reflector should not add duplicate findings to ground_truth."""
+
+    def test_no_duplicate_findings(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        existing_finding = "- Define constants at module level"
+        responses = [
+            "The constant is missing from the namespace.",
+            # LLM returns the same finding that already exists
+            existing_finding,
+        ]
+        idx = {"i": 0}
+
+        class _SeqLLM:
+            def invoke(self, _msgs: Any) -> Any:
+                msg = MagicMock()
+                msg.content = responses[idx["i"] % len(responses)]
+                idx["i"] += 1
+                return msg
+
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: _SeqLLM())
+
+        state = _base_state(
+            test_logs=["ImportError: cannot import HBAR"],
+            ground_truth=[existing_finding],
+        )
+        result = reflector(state)
+
+        # The finding should appear exactly once, not twice
+        assert result["ground_truth"].count(existing_finding) == 1
+
+    def test_new_findings_still_added(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        responses = [
+            "Analysis of the error.",
+            "- Brand new finding\n- Another finding",
+        ]
+        idx = {"i": 0}
+
+        class _SeqLLM:
+            def invoke(self, _msgs: Any) -> Any:
+                msg = MagicMock()
+                msg.content = responses[idx["i"] % len(responses)]
+                idx["i"] += 1
+                return msg
+
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: _SeqLLM())
+
+        state = _base_state(
+            test_logs=["Some error"],
+            ground_truth=["- Existing finding"],
+        )
+        result = reflector(state)
+
+        assert "- Existing finding" in result["ground_truth"]
+        assert "- Brand new finding" in result["ground_truth"]
+        assert "- Another finding" in result["ground_truth"]
+        assert len(result["ground_truth"]) == 3

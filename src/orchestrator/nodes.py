@@ -340,6 +340,25 @@ def coder(state: ScientificState) -> dict[str, Any]:
         f"## Current Phase ({current + 1} of {total}): {phase_title}\n{state['plan']}",
     ]
 
+    # If we have error context from a previous iteration, show the coder
+    # what went wrong so it can fix its own mistakes directly.
+    if state.get("reflection"):
+        error_repeat = state.get("_error_repeat_count", 0)
+        if error_repeat >= 3:
+            user_parts.append(
+                f"## ⚠️  CRITICAL — same error for {error_repeat} consecutive iterations\n"
+                "Your previous code did NOT fix the problem.  Read the error "
+                "analysis below VERY carefully and make DIFFERENT choices this time."
+            )
+        user_parts.append(
+            f"## Previous error analysis\n{state['reflection']}"
+        )
+    if state.get("test_logs"):
+        log_text = "\n---\n".join(state["test_logs"])
+        user_parts.append(
+            f"## Test failures to fix\n```\n{log_text}\n```"
+        )
+
     # Inform coder about files that already exist from prior phases
     existing_drafts = state.get("code_drafts") or {}
     if existing_drafts:
@@ -636,9 +655,19 @@ def verifier(state: ScientificState) -> dict[str, Any]:
             print(f"[explorer] Sandbox directory: {root}")
             logs = pre_errors or _run_pytest(root)
 
+    # Stuck-loop detection: fingerprint the errors and track repeats
+    error_fingerprint = "\n".join(sorted(logs)) if logs else ""
+    prev_fingerprint = state.get("_prev_error_fingerprint", "")
+    if logs and error_fingerprint == prev_fingerprint:
+        error_repeat_count = state.get("_error_repeat_count", 0) + 1
+    else:
+        error_repeat_count = 1 if logs else 0
+
     return {
         "test_logs": logs,
         "iteration_count": state.get("iteration_count", 0) + 1,
+        "_prev_error_fingerprint": error_fingerprint,
+        "_error_repeat_count": error_repeat_count,
     }
 
 
@@ -672,9 +701,11 @@ def reflector(state: ScientificState) -> dict[str, Any]:
     existing = list(state.get("ground_truth", []))
     raw = findings_response.content.strip()
     if raw != "NONE":
+        seen = set(existing)
         for line in raw.splitlines():
             line = line.strip()
-            if line.startswith("- "):
+            if line.startswith("- ") and line not in seen:
                 existing.append(line)
+                seen.add(line)
 
     return {"reflection": reflection, "ground_truth": existing, "_prompt_summary": reflector_user_msg}
