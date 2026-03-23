@@ -50,6 +50,48 @@ Always normalise so that $\int_{-\infty}^{\infty} |\psi(x)|^2 \, dx = 1$.
 Use `numpy.trapz` (or `numpy.trapezoid` on NumPy ≥ 2) for numerical
 integration on a grid.
 
+### Trigonometric functions in NumPy / SciPy
+
+When implementing transcendental equations for bound states you will need
+`tan`, `cot`, `sec`, `csc`, etc.  **Be aware of what NumPy provides:**
+
+| Function | NumPy name | Notes |
+|----------|-----------|-------|
+| sin | `np.sin` | ✅ built-in |
+| cos | `np.cos` | ✅ built-in |
+| tan | `np.tan` | ✅ built-in |
+| cot | — | ❌ **does NOT exist** as `np.cot`. Use `np.cos(x) / np.sin(x)` or `1 / np.tan(x)` |
+| sec | — | ❌ Use `1 / np.cos(x)` |
+| csc | — | ❌ Use `1 / np.sin(x)` |
+| arctan | `np.arctan` | ✅ built-in |
+| arctan2 | `np.arctan2` | ✅ built-in |
+
+**Common mistake:** Writing `np.cot(x)` — this raises `AttributeError:
+module 'numpy' has no attribute 'cot'`.  Always use `np.cos(x) / np.sin(x)`.
+
+Guard against division by zero near poles:
+```python
+# Safe cotangent with NaN at poles instead of ±inf
+def safe_cot(x):
+    s = np.sin(x)
+    return np.where(np.abs(s) > 1e-15, np.cos(x) / s, np.nan)
+```
+
+### Domain validity for transcendental equations
+
+When solving the finite square-well transcendental equations, the
+dimensionless variable $\xi$ must satisfy $0 < \xi < C$ where
+$C = a\sqrt{2mV_0}/\hbar$.  Outside this range, $\sqrt{C^2 - \xi^2}$
+produces `NaN`.
+
+- **Never** evaluate the transcendental functions at $\xi \geq C$.
+- **Never** write tests that call these functions with $\xi > C$ and
+  compare the result with `==`, `<`, or `>` — the result is `NaN` and
+  all comparisons return `False`.
+- Clamp search brackets: `hi = min(hi, C - epsilon)`.
+- If writing tests for the raw transcendental function, only use
+  $\xi$ values strictly inside $[0, C)$.
+
 ### Testing guidance
 
 - Compare eigenvalues against analytically known limits (e.g. infinite-well

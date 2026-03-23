@@ -68,6 +68,8 @@ class ScientificState(TypedDict, total=False):
     current_phase: int
     _prev_error_fingerprint: str
     _error_repeat_count: int
+    _replan_count: int
+    _phase_error_count: int
 
 
 def make_checkpointer(db_path: str = "checkpoints.sqlite") -> SqliteSaver:

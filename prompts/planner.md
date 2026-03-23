@@ -26,10 +26,19 @@ Files: file1.py, file2.py
 ```
 
 Rules for phasing:
+- **Phase 1 MUST be scaffolding only.**  It must contain:
+  - `pyproject.toml` with dependencies
+  - Package layout with `__init__.py` files
+  - All source modules as **stubs** — function signatures with `pass` bodies
+  - Test files with trivial assertions (`assert True`) that verify imports work
+  Phase 1's only goal is a passing `pytest` run that proves the project
+  structure, dependencies, and import graph are correct.
+- **Phase 2 onward** implements real logic, one feature per phase.
 - Each phase must be independently testable — include test files.
 - Earlier phases lay the foundation; later phases build on them.
-- Simple tasks may have a single phase — that is fine.
-- Always include a pyproject.toml in the first phase.
+- Simple tasks may have a single phase — that is fine, but the stub-first
+  rule still applies: the single phase should still use stubs and trivial
+  tests only if the algorithm is non-trivial.
 - The "Files:" line lists the files to create or modify in that phase.
 - Do NOT include full code implementations in the plan.  List function
   signatures (name + parameters) and their purpose only.

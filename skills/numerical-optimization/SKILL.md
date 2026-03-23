@@ -33,6 +33,50 @@ or maximizing functions, curve fitting, or other numerical optimization problems
 - Always provide reasonable initial guesses (`p0`) to avoid local minima.
 - Return uncertainties via the covariance matrix: `perr = np.sqrt(np.diag(pcov))`.
 
+### Transcendental equations with periodic singularities
+
+When solving equations involving `tan(x)`, `cot(x)`, or other periodic
+functions with poles:
+
+- **Never** do a blind sign-change search across the full domain — every
+  pole creates a false sign change that `brentq` will converge to.
+- Instead, **bracket roots analytically** using the branch structure:
+  - For `f(x) = x·tan(x) - g(x)` (even parity): roots live in
+    `(nπ, (n+½)π)` for n = 0, 1, 2, …
+  - For `f(x) = -x·cot(x) - g(x)` (odd parity): roots live in
+    `((n-½)π, nπ)` for n = 1, 2, 3, …
+- Use `brentq` on **each analytic bracket individually**, with endpoints
+  nudged inward by a small epsilon (e.g. `1e-12`) to avoid the poles.
+- **Validate** each root: check `|f(root)| < tol` AND that the root is not
+  near a pole (`|cos(root)| > epsilon` for tan-based equations).
+- Terminate the search when the bracket is empty: `left >= right` or when
+  `g(xi)` becomes imaginary (i.e. `xi > C` for finite-well problems).
+
+Example (finite square well, even parity):
+```python
+import numpy as np
+from scipy.optimize import brentq
+
+def _even_roots(C: float) -> list[float]:
+    """Find xi values satisfying xi·tan(xi) = sqrt(C² - xi²)."""
+    roots = []
+    n = 0
+    while True:
+        lo = n * np.pi + 1e-12
+        hi = (n + 0.5) * np.pi - 1e-12
+        if lo >= C:
+            break
+        hi = min(hi, C - 1e-12)
+        if lo >= hi:
+            n += 1
+            continue
+        f = lambda xi: xi * np.tan(xi) - np.sqrt(C**2 - xi**2)
+        if f(lo) * f(hi) < 0:
+            roots.append(brentq(f, lo, hi))
+        n += 1
+    return roots
+```
+
 ### Testing guidance
 
 - Test with known analytic solutions (e.g. quadratics, trig functions).

@@ -30,7 +30,8 @@ from orchestrator.state import ScientificState, make_checkpointer
 # Load .env file (if present) so env vars are available as CLI defaults
 load_dotenv()
 
-MAX_ITERATIONS = 0  # 0 = unlimited
+MAX_ITERATIONS = int(os.environ.get("EXPLORER_MAX_ITERATIONS", "20"))  # 0 = unlimited
+REPLAN_THRESHOLD = 3  # N total phase failures → re-engage planner
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +60,31 @@ def _make_should_continue(max_iters: int):
     return _should_continue
 
 
+MAX_REPLANS = 2  # max replans per phase before giving up on replanning
+
+
+def _after_reflector(state: ScientificState) -> str:
+    """Route after the reflector: re-plan on persistent failures.
+
+    If the total number of failures in the current phase reaches
+    ``REPLAN_THRESHOLD``, the coder is clearly stuck — send the problem back
+    to the planner so it can decompose the current phase differently or
+    suggest a new algorithm.
+
+    We use ``_phase_error_count`` (total failures, regardless of whether
+    they are identical) rather than ``_error_repeat_count`` because the
+    coder often oscillates between *different* bugs each iteration,
+    keeping ``_error_repeat_count`` at 1 forever.
+
+    Replanning is capped at ``MAX_REPLANS`` per phase to avoid infinite loops.
+    """
+    phase_errors = state.get("_phase_error_count", 0)
+    replan_count = state.get("_replan_count", 0)
+    if phase_errors >= REPLAN_THRESHOLD and replan_count < MAX_REPLANS:
+        return "replan"
+    return "coder"
+
+
 def build_graph(max_iterations: int = MAX_ITERATIONS) -> StateGraph:
     """Construct and compile the Scientific Loop state graph."""
     graph = StateGraph(ScientificState)
@@ -77,7 +103,11 @@ def build_graph(max_iterations: int = MAX_ITERATIONS) -> StateGraph:
         _make_should_continue(max_iterations),
         {"reflect": "reflector", "advance_phase": "advance_phase", "end": END},
     )
-    graph.add_edge("reflector", "coder")
+    graph.add_conditional_edges(
+        "reflector",
+        _after_reflector,
+        {"coder": "coder", "replan": "planner"},
+    )
     graph.add_edge("advance_phase", "coder")
 
     return graph
@@ -145,10 +175,10 @@ def cli() -> None:
 )
 @click.option(
     "--max-iterations",
-    default=MAX_ITERATIONS,
-    show_default=True,
+    default=lambda: int(os.environ.get("EXPLORER_MAX_ITERATIONS", "20")),
+    show_default="20",
     type=int,
-    help="Maximum plan-code-verify cycles before stopping (0 = unlimited).",
+    help="Maximum plan-code-verify cycles before stopping (0 = unlimited, env: EXPLORER_MAX_ITERATIONS).",
 )
 @click.option(
     "--provider",
@@ -332,7 +362,7 @@ def run(task: str | None, task_file: str | None, thread_id: str, db: str,
     # Set up reporting
     from orchestrator.reporter import ChatLogger, report_node
 
-    matched_skill_names: list[str] = [s.name for s in matched] if skills and matched else []
+    matched_skill_names: list[str] = [s.name for s in matched]
     chat_logger = ChatLogger(
         chat_dir,
         task=task or "",

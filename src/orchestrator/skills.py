@@ -178,16 +178,31 @@ def match_skills(skills: list[Skill], task: str) -> list[Skill]:
     return matched
 
 
+_RECIPE_RE = re.compile(r"^#{2}\s+Recipe\b", re.MULTILINE | re.IGNORECASE)
+
+
 def format_skills_context(skills: list[Skill]) -> str:
     """Render matched skills into a prompt section.
 
-    Returns an empty string if *skills* is empty.
+    Returns an empty string if *skills* is empty.  When a skill contains
+    recipe sections (``## Recipe:``), a MUST-USE directive is prepended
+    so the LLM treats them as prescriptive rather than advisory.
     """
     if not skills:
         return ""
     sections: list[str] = ["## Relevant Skills\n"]
     for skill in skills:
+        has_recipe = bool(_RECIPE_RE.search(skill.content))
         sections.append(f"### Skill: {skill.name}\n")
+        if has_recipe:
+            sections.append(
+                "**⚠️ MANDATORY:** This skill contains a recipe that "
+                "directly applies to this task.  You MUST follow the "
+                "recipe's algorithm and code pattern.  Do NOT substitute "
+                "a different approach (e.g. matrix diagonalisation instead "
+                "of root-finding) unless the recipe explicitly says "
+                "alternatives are acceptable.\n"
+            )
         sections.append(skill.content)
         sections.append("")
     return "\n".join(sections)

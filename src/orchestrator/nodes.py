@@ -7,9 +7,11 @@ state dict that LangGraph merges back into the graph state.
 from __future__ import annotations
 
 import ast
+import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,8 @@ from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
 
 from .state import ScientificState
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Prompt loading
@@ -169,17 +173,40 @@ def _write_plan_artifact(phases: list[dict[str, Any]], current: int) -> None:
 def planner(state: ScientificState) -> dict[str, Any]:
     """Analyse the task and produce a phased implementation plan.
 
-    The planner runs once at the start (and again when advancing phases).
-    On error loops the reflector feeds directly back to the coder, so the
-    planner is not invoked during revision iterations.
+    Called in two contexts:
+
+    1. **Initial planning** (``plan_phases`` is empty) — produce a fresh
+       phased plan from the task description.
+    2. **Replanning** (``plan_phases`` exists and ``reflection`` is set) —
+       the coder has been stuck on the same error for multiple iterations.
+       Revise the plan for the *current* phase, taking the error analysis
+       and test logs into account so the coder can try a different approach.
     """
     llm = get_llm()
+
+    is_replan = bool(state.get("plan_phases")) and bool(state.get("reflection"))
 
     user_parts: list[str] = [f"## Task\n{state['task_description']}"]
     if state.get("mathematical_constants"):
         user_parts.append(
             f"## Constants\n{state['mathematical_constants']}"
         )
+
+    if is_replan:
+        phases = state["plan_phases"]
+        current = state.get("current_phase", 0)
+        phase = phases[current]
+        user_parts.append(
+            f"## ⚠️ REPLAN REQUEST — Phase {phase['id']}: {phase['title']}\n"
+            f"The coder has been stuck on this phase for multiple iterations "
+            f"with the same error.  Revise the plan for THIS phase only.\n\n"
+            f"**Current phase description:**\n{phase['description']}\n\n"
+            f"**Error analysis from reflector:**\n{state['reflection']}"
+        )
+        if state.get("test_logs"):
+            log_text = "\n---\n".join(state["test_logs"])
+            user_parts.append(f"## Failing test output\n```\n{log_text}\n```")
+
     if state.get("skills_context"):
         user_parts.append(state["skills_context"])
 
@@ -191,6 +218,27 @@ def planner(state: ScientificState) -> dict[str, Any]:
     ])
 
     raw_plan = response.content
+
+    if is_replan:
+        # Only update the current phase description — keep other phases intact
+        phases = list(state["plan_phases"])
+        current = state.get("current_phase", 0)
+        new_phases = _parse_plan_phases(raw_plan)
+        # Use the first phase from the re-plan as the revised current phase
+        if new_phases:
+            phases[current]["description"] = new_phases[0]["description"]
+            phases[current]["title"] = new_phases[0]["title"]
+            if new_phases[0].get("files"):
+                phases[current]["files"] = new_phases[0]["files"]
+        plan_text = phases[current]["description"]
+        _write_plan_artifact(phases, current)
+        return {
+            "plan": plan_text,
+            "plan_phases": phases,
+            "_prompt_summary": user_message,
+            "_error_repeat_count": 0,  # reset after replan
+            "_replan_count": state.get("_replan_count", 0) + 1,
+        }
 
     plan_phases = _parse_plan_phases(raw_plan)
     current_phase = 0
@@ -237,6 +285,10 @@ def advance_phase(state: ScientificState) -> dict[str, Any]:
         "current_phase": next_idx,
         "reflection": "",  # clear stale reflection for new phase
         "ground_truth": [],  # clear stale findings for new phase
+        "_prev_error_fingerprint": "",  # reset for new phase
+        "_error_repeat_count": 0,
+        "_replan_count": 0,
+        "_phase_error_count": 0,
     }
 
 
@@ -368,10 +420,18 @@ def coder(state: ScientificState) -> dict[str, Any]:
     raw_content = response.content
     new_drafts = _parse_code_blocks(raw_content)
 
-    # On revision iterations (reflector → coder), protect existing test files.
-    # The coder should fix the implementation, not rewrite the test expectations.
+    # On revision iterations, protect existing test files ONLY after the
+    # coder has already had one chance to fix them (_phase_error_count >= 2).
+    # This lets the coder correct genuinely wrong tests it wrote on the first
+    # pass of a new phase, while still preventing it from weakening tests to
+    # match broken implementation code on subsequent iterations.
+    # NOTE: We use _phase_error_count (total failures in this phase) rather
+    # than _error_repeat_count (consecutive identical failures) because the
+    # coder often oscillates between different errors each iteration, making
+    # the repeat count stay at 1 forever.
     is_revision = bool(state.get("reflection"))
-    if is_revision and existing_drafts:
+    phase_errors = state.get("_phase_error_count", 0)
+    if is_revision and existing_drafts and phase_errors >= 2:
         protected = {
             fp for fp in existing_drafts
             if fp.rpartition("/")[2].startswith("test_")
@@ -436,11 +496,23 @@ def _parse_code_blocks(text: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+_PYTEST_TIMING_RE = re.compile(r" in \d+\.\d+s")
+
+
+def _normalize_pytest_output(text: str) -> str:
+    """Strip variable parts from pytest output for fingerprinting.
+
+    Removes timing information (``in 0.41s``) so that consecutive runs
+    with the same failures produce identical fingerprints.
+    """
+    return _PYTEST_TIMING_RE.sub("", text)
+
+
 def _run_pytest(root: Path, extra_env: dict[str, str] | None = None) -> list[str]:
     """Run ``pytest`` inside *root* and return failure logs (empty on success)."""
     env = {**os.environ, **(extra_env or {})}
     result = subprocess.run(  # noqa: S603
-        ["python", "-m", "pytest", str(root), "-v", "--tb=short"],
+        [sys.executable, "-m", "pytest", str(root), "-v", "--tb=short"],
         capture_output=True,
         text=True,
         timeout=120,
@@ -471,7 +543,7 @@ def _prepare_sandbox(root: Path, code_drafts: dict[str, str]) -> None:
     # Attempt editable install if pyproject.toml is present
     if (root / "pyproject.toml").exists():
         pip_result = subprocess.run(  # noqa: S603
-            ["python", "-m", "pip", "install", "-e", str(root),
+            [sys.executable, "-m", "pip", "install", "-e", str(root),
              "--no-build-isolation", "--quiet"],
             capture_output=True,
             text=True,
@@ -519,7 +591,7 @@ def _ensure_importable(root: Path, code_drafts: dict[str, str]) -> None:
     """
     if (root / "pyproject.toml").exists():
         pip_result = subprocess.run(  # noqa: S603
-            ["python", "-m", "pip", "install", "-e", str(root),
+            [sys.executable, "-m", "pip", "install", "-e", str(root),
              "--no-build-isolation", "--quiet"],
             capture_output=True,
             text=True,
@@ -629,6 +701,44 @@ def _check_import_consistency(code_drafts: dict[str, str]) -> list[str]:
     return errors
 
 
+def _check_syntax(code_drafts: dict[str, str]) -> list[str]:
+    """Check every ``.py`` draft for syntax errors using ``ast.parse``.
+
+    Returns a list of human-readable error strings (empty if all OK).
+    Running this *before* pytest gives the reflector a clear, actionable
+    message instead of a cryptic collection error.
+    """
+    errors: list[str] = []
+    for fpath, source in sorted(code_drafts.items()):
+        if not fpath.endswith(".py"):
+            continue
+        try:
+            ast.parse(source, filename=fpath)
+        except SyntaxError as exc:
+            lineno = exc.lineno or "?"
+            msg = exc.msg or "unknown syntax error"
+            errors.append(f"SyntaxError in {fpath} line {lineno}: {msg}")
+    return errors
+
+
+def _warn_stale_files(
+    root: Path, code_drafts: dict[str, str]
+) -> None:
+    """Remove ``.py`` files in *root* that are not part of *code_drafts*.
+
+    When the coder rewrites all files each iteration, leftover files from a
+    previous run may confuse ``pytest``.  This keeps the output directory in
+    sync with the current code drafts.
+    """
+    expected = {root / fpath for fpath in code_drafts}
+    for py_file in root.rglob("*.py"):
+        if py_file.name == "__init__.py":
+            continue
+        if py_file not in expected:
+            logger.warning("Removing stale file: %s", py_file)
+            py_file.unlink()
+
+
 def _check_duplicate_modules(code_drafts: dict[str, str]) -> list[str]:
     """Detect packages that appear in both flat and ``src/`` layouts.
 
@@ -674,7 +784,9 @@ def verifier(state: ScientificState) -> dict[str, Any]:
         }
 
     # Quick structural and import checks before running pytest
-    pre_errors = _check_duplicate_modules(code_drafts)
+    pre_errors = _check_syntax(code_drafts)
+    if not pre_errors:
+        pre_errors = _check_duplicate_modules(code_drafts)
     if not pre_errors:
         pre_errors = _check_import_consistency(code_drafts)
 
@@ -683,6 +795,8 @@ def verifier(state: ScientificState) -> dict[str, Any]:
     if output_dir:
         # Write mode — run pytest in the real output directory
         root = Path(output_dir).resolve()
+        # Warn about stale .py files left from a previous run
+        _warn_stale_files(root, code_drafts)
         _ensure_importable(root, code_drafts)
         logs = pre_errors or _run_pytest(root)
     else:
@@ -694,18 +808,25 @@ def verifier(state: ScientificState) -> dict[str, Any]:
             logs = pre_errors or _run_pytest(root)
 
     # Stuck-loop detection: fingerprint the errors and track repeats
-    error_fingerprint = "\n".join(sorted(logs)) if logs else ""
+    normalised = [_normalize_pytest_output(l) for l in logs] if logs else []
+    error_fingerprint = "\n".join(sorted(normalised)) if normalised else ""
     prev_fingerprint = state.get("_prev_error_fingerprint", "")
     if logs and error_fingerprint == prev_fingerprint:
         error_repeat_count = state.get("_error_repeat_count", 0) + 1
     else:
         error_repeat_count = 1 if logs else 0
 
+    # Total failure count for this phase (unlike _error_repeat_count which
+    # only tracks consecutive *identical* errors).  Used by the coder to
+    # decide when to lock test files.
+    phase_error_count = state.get("_phase_error_count", 0) + (1 if logs else 0)
+
     return {
         "test_logs": logs,
         "iteration_count": state.get("iteration_count", 0) + 1,
         "_prev_error_fingerprint": error_fingerprint,
         "_error_repeat_count": error_repeat_count,
+        "_phase_error_count": phase_error_count,
     }
 
 
@@ -729,14 +850,18 @@ def reflector(state: ScientificState) -> dict[str, Any]:
     reflection = response.content
 
     # Extract key findings
+    existing = list(state.get("ground_truth", []))
+    existing_text = "\n".join(existing) if existing else "(none yet)"
     findings_response = llm.invoke([
         SystemMessage(content=findings_prompt),
         HumanMessage(
-            content=f"## Reflection\n{reflection}\n\n## Test logs\n```\n{log_text}\n```"
+            content=(
+                f"## Existing findings (do NOT repeat these)\n{existing_text}\n\n"
+                f"## Reflection\n{reflection}\n\n## Test logs\n```\n{log_text}\n```"
+            )
         ),
     ])
 
-    existing = list(state.get("ground_truth", []))
     raw = findings_response.content.strip()
     if raw != "NONE":
         seen = set(existing)

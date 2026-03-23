@@ -11,12 +11,15 @@ import pytest
 from orchestrator.nodes import (
     _check_duplicate_modules,
     _check_import_consistency,
+    _check_syntax,
     _ensure_importable,
     _extract_signatures,
     _looks_like_filepath,
+    _normalize_pytest_output,
     _parse_code_blocks,
     _parse_plan_phases,
     _prepare_sandbox,
+    _warn_stale_files,
     _write_code_drafts,
     _write_plan_artifact,
     advance_phase,
@@ -929,8 +932,8 @@ class TestCoderErrorContext:
     def test_revision_protects_existing_test_files(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """On revision iterations (reflection is set), existing test files
-        must not be overwritten even if the coder emits them."""
+        """On revision iterations with phase_error_count >= 2,
+        existing test files must not be overwritten even if the coder emits them."""
         # The coder emits both solver.py and test_solver.py
         llm_output = (
             "```solver.py\ndef solve(): return 42\n```\n\n"
@@ -943,6 +946,7 @@ class TestCoderErrorContext:
         state = _base_state(
             plan="fix solver",
             reflection="Return value is wrong.",
+            _phase_error_count=2,
             code_drafts={
                 "solver.py": "def solve(): return -1\n",
                 "tests/test_solver.py": original_test,
@@ -954,6 +958,33 @@ class TestCoderErrorContext:
         assert "return 42" in result["code_drafts"]["solver.py"]
         # Test file should be PROTECTED (original preserved)
         assert result["code_drafts"]["tests/test_solver.py"] == original_test
+
+    def test_first_revision_allows_test_fixes(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """On the first revision (phase_error_count < 2), test files should
+        NOT be protected — the coder needs one chance to fix bad tests."""
+        rewritten_test = "from solver import solve\ndef test_it(): assert solve() == 42\n"
+        llm_output = (
+            "```solver.py\ndef solve(): return 42\n```\n\n"
+            f"```tests/test_solver.py\n{rewritten_test}```\n"
+        )
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(
+            plan="fix solver",
+            reflection="Tests are wrong — assert len==0 but always >=1 bound state.",
+            _phase_error_count=1,
+            code_drafts={
+                "solver.py": "def solve(): return -1\n",
+                "tests/test_solver.py": "assert False  # wrong tests\n",
+            },
+        )
+        result = coder(state)
+
+        # Test file should be UPDATED (not protected on first revision)
+        assert result["code_drafts"]["tests/test_solver.py"] == rewritten_test
 
     def test_first_iteration_allows_test_files(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -1066,6 +1097,37 @@ class TestStuckLoopDetection:
         assert result["_error_repeat_count"] == 0
         assert result["_prev_error_fingerprint"] == ""
 
+    def test_phase_error_count_increments_on_failure(self) -> None:
+        state = _base_state(
+            code_drafts={
+                "pkg/__init__.py": "",
+                "pkg/mod.py": "def solve(): pass\n",
+                "tests/test_mod.py": (
+                    "from pkg.mod import MISSING\n"
+                    "def test_it(): pass\n"
+                ),
+            },
+            _phase_error_count=3,
+        )
+        result = verifier(state)
+        assert result["_phase_error_count"] == 4
+
+    def test_phase_error_count_unchanged_on_pass(self) -> None:
+        state = _base_state(
+            code_drafts={
+                "pkg/__init__.py": "",
+                "pkg/mod.py": "def solve(): pass\n",
+                "tests/test_mod.py": (
+                    "from pkg.mod import solve\n"
+                    "def test_it():\n"
+                    "    assert solve() is None\n"
+                ),
+            },
+            _phase_error_count=2,
+        )
+        result = verifier(state)
+        assert result["_phase_error_count"] == 2
+
 
 # ---------------------------------------------------------------------------
 # Ground truth deduplication
@@ -1131,3 +1193,375 @@ class TestGroundTruthDedup:
         assert "- Brand new finding" in result["ground_truth"]
         assert "- Another finding" in result["ground_truth"]
         assert len(result["ground_truth"]) == 3
+
+    def test_existing_findings_passed_to_llm(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The findings LLM call should receive existing findings so it can
+        avoid repeating them."""
+        captured_msgs: list[Any] = []
+        responses = ["Analysis.", "NONE"]
+        idx = {"i": 0}
+
+        class _CaptureLLM:
+            def invoke(self, msgs: Any) -> Any:
+                captured_msgs.append(msgs)
+                msg = MagicMock()
+                msg.content = responses[idx["i"] % len(responses)]
+                idx["i"] += 1
+                return msg
+
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: _CaptureLLM())
+
+        state = _base_state(
+            test_logs=["assert 1 == 0"],
+            ground_truth=["- Solver returns wrong count"],
+        )
+        reflector(state)
+
+        # Second LLM call is the findings extraction
+        assert len(captured_msgs) == 2
+        findings_user_msg = captured_msgs[1][1].content
+        assert "Existing findings" in findings_user_msg
+        assert "Solver returns wrong count" in findings_user_msg
+
+
+# ---------------------------------------------------------------------------
+# Syntax pre-check
+# ---------------------------------------------------------------------------
+
+
+class TestCheckSyntax:
+    """_check_syntax should catch syntax errors before pytest runs."""
+
+    def test_valid_code_returns_empty(self) -> None:
+        drafts = {"solver.py": "def solve():\n    return 42\n"}
+        assert _check_syntax(drafts) == []
+
+    def test_detects_syntax_error(self) -> None:
+        drafts = {
+            "solver.py": "def solve():\nreturn 42\n",  # IndentationError
+        }
+        errors = _check_syntax(drafts)
+        assert len(errors) == 1
+        assert "SyntaxError" in errors[0]
+        assert "solver.py" in errors[0]
+
+    def test_multiple_files_multiple_errors(self) -> None:
+        drafts = {
+            "good.py": "x = 1\n",
+            "bad1.py": "def f(\n",
+            "bad2.py": "class:\n",
+        }
+        errors = _check_syntax(drafts)
+        assert len(errors) == 2
+        combined = "\n".join(errors)
+        assert "bad1.py" in combined
+        assert "bad2.py" in combined
+
+    def test_skips_non_python_files(self) -> None:
+        drafts = {
+            "README.md": "# not python {{{",
+            "solver.py": "x = 1\n",
+        }
+        assert _check_syntax(drafts) == []
+
+    def test_unindented_docstring_detected(self) -> None:
+        """Reproduce the nemotron bug: method body not indented."""
+        drafts = {
+            "tests/test_solver.py": (
+                "def test_something():\n"
+                '"""This docstring is not indented."""\n'
+                "    pass\n"
+            ),
+        }
+        errors = _check_syntax(drafts)
+        assert len(errors) == 1
+        assert "IndentationError" in errors[0] or "SyntaxError" in errors[0]
+
+
+# ---------------------------------------------------------------------------
+# Stale file cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestWarnStaleFiles:
+    """_warn_stale_files should remove .py files not in code_drafts."""
+
+    def test_removes_stale_file(self, tmp_path: Path) -> None:
+        # Create a stale file from a "previous run"
+        stale = tmp_path / "old_module.py"
+        stale.write_text("# stale\n")
+        # Current drafts don't include old_module.py
+        drafts = {"solver.py": "x = 1\n"}
+        _warn_stale_files(tmp_path, drafts)
+        assert not stale.exists()
+
+    def test_keeps_current_files(self, tmp_path: Path) -> None:
+        current = tmp_path / "solver.py"
+        current.write_text("x = 1\n")
+        drafts = {"solver.py": "x = 1\n"}
+        _warn_stale_files(tmp_path, drafts)
+        assert current.exists()
+
+    def test_keeps_init_files(self, tmp_path: Path) -> None:
+        """__init__.py files should never be removed."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        init = pkg / "__init__.py"
+        init.write_text("")
+        drafts = {"solver.py": "x = 1\n"}
+        _warn_stale_files(tmp_path, drafts)
+        assert init.exists()
+
+    def test_removes_stale_in_subdirectory(self, tmp_path: Path) -> None:
+        sub = tmp_path / "pkg"
+        sub.mkdir()
+        stale = sub / "old.py"
+        stale.write_text("# old\n")
+        drafts = {"pkg/new.py": "x = 1\n"}
+        _warn_stale_files(tmp_path, drafts)
+        assert not stale.exists()
+
+
+# ---------------------------------------------------------------------------
+# Planner replanning
+# ---------------------------------------------------------------------------
+
+class TestPlannerReplan:
+    """When plan_phases exist and reflection is set, the planner should revise
+    only the current phase instead of creating a fresh plan from scratch."""
+
+    def test_replan_updates_current_phase_only(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        revised = "## Phase 1: Solver v2\nUse brentq instead of matrix diag.\nFiles: solver.py\n"
+        fake = _FakeLLM(revised)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        phases = [
+            {"id": 1, "title": "Solver", "description": "Build matrix solver.", "status": "pending", "files": ["solver.py"]},
+            {"id": 2, "title": "CLI", "description": "Build CLI.", "status": "pending", "files": ["cli.py"]},
+        ]
+        state = _base_state(
+            plan_phases=phases,
+            current_phase=0,
+            reflection="Matrix approach has inherent discretisation error.",
+            test_logs=["FAILED test_solver.py::test_energy - AssertionError"],
+        )
+        result = planner(state)
+
+        # Phase 2 should be untouched
+        assert len(result["plan_phases"]) == 2
+        assert result["plan_phases"][1]["title"] == "CLI"
+        assert result["plan_phases"][1]["description"] == "Build CLI."
+        # Phase 1 should be updated
+        assert "brentq" in result["plan_phases"][0]["description"]
+        assert result["plan_phases"][0]["title"] == "Solver v2"
+        # Error repeat count should be reset
+        assert result["_error_repeat_count"] == 0
+
+    def test_replan_includes_error_context(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        fake = _FakeLLM("## Phase 1: Fix\nNew approach.\nFiles: solver.py\n")
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        phases = [
+            {"id": 1, "title": "Solver", "description": "Build solver.", "status": "pending", "files": []},
+        ]
+        state = _base_state(
+            plan_phases=phases,
+            current_phase=0,
+            reflection="Off-by-one in bracket computation.",
+            test_logs=["FAILED test_solver - assert 1.73 != 1.71"],
+        )
+        result = planner(state)
+
+        # The prompt should contain the error analysis and test logs
+        assert "REPLAN REQUEST" in result["_prompt_summary"]
+        assert "Off-by-one" in result["_prompt_summary"]
+        assert "assert 1.73 != 1.71" in result["_prompt_summary"]
+
+    def test_initial_plan_not_treated_as_replan(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """When plan_phases is empty (initial call), even with reflection set,
+        the planner should produce a fresh plan."""
+        monkeypatch.chdir(tmp_path)
+        fake = _FakeLLM("## Phase 1: Core\nBuild core.\nFiles: core.py\n")
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(reflection="Some stale reflection from a previous bug")
+        result = planner(state)
+
+        assert result["current_phase"] == 0
+        assert "REPLAN" not in result.get("_prompt_summary", "")
+
+    def test_replan_single_phase(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Replan should work even if there's only one phase."""
+        monkeypatch.chdir(tmp_path)
+        fake = _FakeLLM("## Phase 1: Revised\nNew approach.\nFiles: solver.py\n")
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        phases = [
+            {"id": 1, "title": "Solver", "description": "Build.", "status": "pending", "files": []},
+        ]
+        state = _base_state(
+            plan_phases=phases,
+            current_phase=0,
+            reflection="Error detected.",
+        )
+        result = planner(state)
+
+        assert len(result["plan_phases"]) == 1
+        assert "New approach" in result["plan_phases"][0]["description"]
+        assert result["_replan_count"] == 1
+
+    def test_replan_increments_replan_count(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        fake = _FakeLLM("## Phase 1: Try3\nThird try.\nFiles: solver.py\n")
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        phases = [
+            {"id": 1, "title": "Solver", "description": "Build.", "status": "pending", "files": []},
+        ]
+        state = _base_state(
+            plan_phases=phases,
+            current_phase=0,
+            reflection="Still broken.",
+            _replan_count=1,
+        )
+        result = planner(state)
+        assert result["_replan_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# After-reflector routing
+# ---------------------------------------------------------------------------
+
+class TestAfterReflector:
+    """The _after_reflector routing should send to planner when total phase
+    failures hit the threshold, and to coder otherwise."""
+
+    def test_routes_to_coder_below_threshold(self) -> None:
+        from src.cli import _after_reflector
+
+        state = _base_state(_phase_error_count=2)
+        assert _after_reflector(state) == "coder"
+
+    def test_routes_to_replan_at_threshold(self) -> None:
+        from src.cli import _after_reflector, REPLAN_THRESHOLD
+
+        state = _base_state(_phase_error_count=REPLAN_THRESHOLD)
+        assert _after_reflector(state) == "replan"
+
+    def test_routes_to_replan_above_threshold(self) -> None:
+        from src.cli import _after_reflector, REPLAN_THRESHOLD
+
+        state = _base_state(_phase_error_count=REPLAN_THRESHOLD + 2)
+        assert _after_reflector(state) == "replan"
+
+    def test_routes_to_coder_when_no_error_count(self) -> None:
+        from src.cli import _after_reflector
+
+        state = _base_state()
+        assert _after_reflector(state) == "coder"
+
+    def test_routes_to_coder_when_replan_exhausted(self) -> None:
+        """After MAX_REPLANS, even if error threshold is hit, route to coder."""
+        from src.cli import _after_reflector, MAX_REPLANS, REPLAN_THRESHOLD
+
+        state = _base_state(
+            _phase_error_count=REPLAN_THRESHOLD,
+            _replan_count=MAX_REPLANS,
+        )
+        assert _after_reflector(state) == "coder"
+
+    def test_oscillating_errors_still_trigger_replan(self) -> None:
+        """When errors are different each iteration (repeat count stays at 1),
+        but phase error count accumulates, replan should still trigger."""
+        from src.cli import _after_reflector, REPLAN_THRESHOLD
+
+        # Simulates: 3 failures with _error_repeat_count=1 (all different)
+        # but _phase_error_count=3 (total failures monotonically counted)
+        state = _base_state(
+            _error_repeat_count=1,
+            _phase_error_count=REPLAN_THRESHOLD,
+        )
+        assert _after_reflector(state) == "replan"
+
+
+# ---------------------------------------------------------------------------
+# Skills MUST-USE directive
+# ---------------------------------------------------------------------------
+
+class TestSkillsMustUseDirective:
+    """format_skills_context should add a mandatory directive when the skill
+    contains a recipe section."""
+
+    def test_recipe_skill_gets_must_use(self, tmp_path: Path) -> None:
+        from orchestrator.skills import Skill, format_skills_context
+
+        skill_file = tmp_path / "SKILL.md"
+        skill_file.write_text("Some intro.\n\n## Recipe: Transcendental equations\nUse brentq.\n")
+        skill = Skill(
+            name="numerical-optimization",
+            description="Optimization recipes",
+            path=skill_file,
+        )
+        result = format_skills_context([skill])
+        assert "MANDATORY" in result
+        assert "MUST follow" in result
+
+    def test_non_recipe_skill_no_must_use(self, tmp_path: Path) -> None:
+        from orchestrator.skills import Skill, format_skills_context
+
+        skill_file = tmp_path / "SKILL.md"
+        skill_file.write_text("Use pytest.\nArrange-Act-Assert pattern.\n")
+        skill = Skill(
+            name="testing",
+            description="Testing best practices",
+            path=skill_file,
+        )
+        result = format_skills_context([skill])
+        assert "MANDATORY" not in result
+        assert "Skill: testing" in result
+
+    def test_empty_skills_returns_empty(self) -> None:
+        from orchestrator.skills import format_skills_context
+
+        assert format_skills_context([]) == ""
+
+
+# ---------------------------------------------------------------------------
+# Pytest output normalization
+# ---------------------------------------------------------------------------
+
+class TestNormalizePytestOutput:
+    """_normalize_pytest_output should strip variable timing info."""
+
+    def test_strips_timing(self) -> None:
+        raw = "========================= 1 failed, 3 passed in 0.41s =========================="
+        result = _normalize_pytest_output(raw)
+        assert "0.41s" not in result
+        assert "1 failed, 3 passed" in result
+
+    def test_strips_different_timings(self) -> None:
+        a = _normalize_pytest_output("=== 1 failed in 0.41s ===")
+        b = _normalize_pytest_output("=== 1 failed in 1.23s ===")
+        assert a == b
+
+    def test_preserves_rest_of_output(self) -> None:
+        raw = "FAILED tests/test_solver.py::test_x - assert 3 == 0\n"
+        assert _normalize_pytest_output(raw) == raw
+
+    def test_handles_no_timing(self) -> None:
+        raw = "SyntaxError in solver.py line 5: invalid syntax"
+        assert _normalize_pytest_output(raw) == raw
