@@ -46,10 +46,60 @@ Project structure:
   the EXACT function/class names that the module defines.  Double-check that
   every name in your test imports exists in the module you wrote above.
 - Do NOT generate conftest.py — the test runner creates it automatically.
-- Always generate a minimal pyproject.toml with [project] and dependencies.
+- Always generate pyproject.toml with ALL THREE required sections.  Use this
+  exact template (replace my_package and dependencies):
+
+  ```pyproject.toml
+  [build-system]
+  requires = ["hatchling"]
+  build-backend = "hatchling.build"
+
+  [project]
+  name = "my-package"
+  version = "0.1.0"
+  requires-python = ">=3.9"
+  dependencies = ["numpy", "scipy"]
+  ```
+
+  CRITICAL: [build-system] is mandatory — without it `pip install -e .` fails.
+  Do NOT mix build backends (e.g. [tool.setuptools] with hatchling backend).
+  For flat layout, no extra config is needed.  For src/ layout, add:
+  [tool.hatch.build.targets.wheel]
+  packages = ["src/my_package"]
+- To DELETE an obsolete file (e.g. when switching from flat to src/ layout),
+  emit a code block with ONLY `# DELETE` as its content:
+
+  ```old_package/solver.py
+  # DELETE
+  ```
+
+  This removes the file from the project.  Use this when restructuring to
+  avoid duplicate layouts.
+
+Cross-module consistency:
+- When one module imports a function from another, the call site MUST match
+  the function's actual signature (argument count, names, and return type).
+- If you change a function's return type (e.g. returning a tuple instead of
+  a single value), you MUST update ALL callers in every file.
+- If you add required parameters to a function, update all call sites.
+
+Click CLI options:
+- Click LOWERCASES option names: `--V0` becomes parameter `v0` (not `V0`).
+  Always use lowercase option names (e.g. `--v0`) to avoid confusion, or
+  explicitly set the parameter name: `@click.option('--V0', 'v0', ...)`.
+- Test CLIs via `subprocess.run([sys.executable, '-m', 'pkg.cli'] + args)`
+  (module invocation), NOT `subprocess.run([sys.executable, 'pkg/cli.py'])`
+  (direct script), to avoid relative import errors.
 
 When fixing test failures ("Previous error analysis" section is present):
 - Fix the IMPLEMENTATION code, not the tests.  Tests are the specification.
 - Do NOT regenerate test files.  Only emit the source files that need changes.
 - If a test expectation is truly wrong, explain why in a comment but still
   do not change it — the reflector must explicitly flag test errors first.
+
+Docstring safety:
+- NEVER use backslash-prefixed LaTeX commands (like \psi, \hbar, \frac)
+  directly inside docstrings.  Python treats \p, \h, \f as invalid escape
+  sequences, causing SyntaxError.
+- Instead, use raw docstrings: r"""...""" for any docstring containing
+  backslashes, OR spell out the math in plain text (e.g., "psi", "hbar").

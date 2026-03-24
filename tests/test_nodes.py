@@ -9,16 +9,20 @@ from unittest.mock import MagicMock
 import pytest
 
 from orchestrator.nodes import (
+    _check_cross_module_contracts,
     _check_duplicate_modules,
     _check_import_consistency,
+    _check_pyproject_toml,
     _check_syntax,
     _ensure_importable,
+    _pick_replan_phase,
     _extract_signatures,
     _looks_like_filepath,
     _normalize_pytest_output,
     _parse_code_blocks,
     _parse_plan_phases,
     _prepare_sandbox,
+    _resolve_duplicate_layouts,
     _warn_stale_files,
     _write_code_drafts,
     _write_plan_artifact,
@@ -793,6 +797,148 @@ class TestCheckImportConsistency:
         assert "not a package" in errors[0]
         assert "square_well.solver" in errors[0]
 
+
+# ---------------------------------------------------------------------------
+# Cross-module contract checking
+# ---------------------------------------------------------------------------
+
+
+class TestCheckCrossModuleContracts:
+    """Detect interface mismatches between function definitions and call sites."""
+
+    def test_matching_contracts_pass(self) -> None:
+        drafts = {
+            "pkg/solver.py": (
+                "def find_energies(a: float, v0: float) -> list[float]:\n"
+                "    return [1.0, 2.0]\n"
+            ),
+            "pkg/cli.py": (
+                "from pkg.solver import find_energies\n"
+                "energies = find_energies(1.0, 10.0)\n"
+            ),
+        }
+        assert _check_cross_module_contracts(drafts) == []
+
+    def test_return_unpacking_mismatch_detected(self) -> None:
+        """CLI unpacks (energies, parities) but solver returns only energies."""
+        drafts = {
+            "pkg/solver.py": (
+                "def find_energies(a: float, v0: float) -> list[float]:\n"
+                "    return [1.0, 2.0]\n"
+            ),
+            "pkg/cli.py": (
+                "from pkg.solver import find_energies\n"
+                "energies, parities = find_energies(1.0, 10.0)\n"
+            ),
+        }
+        errors = _check_cross_module_contracts(drafts)
+        assert len(errors) == 1
+        assert "find_energies" in errors[0]
+        assert "1 value" in errors[0]
+        assert "unpacks into 2" in errors[0]
+
+    def test_tuple_return_to_single_var_detected(self) -> None:
+        """Solver returns (energies, parities) but caller assigns to single var."""
+        drafts = {
+            "pkg/solver.py": (
+                "def find_energies(a: float, v0: float):\n"
+                "    return [1.0], ['even']\n"
+            ),
+            "pkg/cli.py": (
+                "from pkg.solver import find_energies\n"
+                "result = find_energies(1.0, 10.0)\n"
+            ),
+        }
+        errors = _check_cross_module_contracts(drafts)
+        assert len(errors) == 1
+        assert "tuple of 2" in errors[0]
+        assert "single variable" in errors[0]
+
+    def test_correct_tuple_unpacking_passes(self) -> None:
+        drafts = {
+            "pkg/solver.py": (
+                "def find_energies(a: float, v0: float):\n"
+                "    return [1.0], ['even']\n"
+            ),
+            "pkg/cli.py": (
+                "from pkg.solver import find_energies\n"
+                "energies, parities = find_energies(1.0, 10.0)\n"
+            ),
+        }
+        assert _check_cross_module_contracts(drafts) == []
+
+    def test_too_few_args_detected(self) -> None:
+        drafts = {
+            "pkg/solver.py": (
+                "def find_energies(a: float, v0: float) -> list:\n"
+                "    return []\n"
+            ),
+            "pkg/cli.py": (
+                "from pkg.solver import find_energies\n"
+                "find_energies(1.0)\n"
+            ),
+        }
+        errors = _check_cross_module_contracts(drafts)
+        assert len(errors) == 1
+        assert "1 positional" in errors[0]
+        assert "at least 2" in errors[0]
+
+    def test_too_many_args_detected(self) -> None:
+        drafts = {
+            "pkg/solver.py": (
+                "def find_energies(a: float, v0: float) -> list:\n"
+                "    return []\n"
+            ),
+            "pkg/cli.py": (
+                "from pkg.solver import find_energies\n"
+                "find_energies(1.0, 10.0, 'extra')\n"
+            ),
+        }
+        errors = _check_cross_module_contracts(drafts)
+        assert len(errors) == 1
+        assert "3 positional" in errors[0]
+        assert "at most 2" in errors[0]
+
+    def test_default_args_not_required(self) -> None:
+        drafts = {
+            "pkg/solver.py": (
+                "def find_energies(a: float, v0: float = 10.0) -> list:\n"
+                "    return []\n"
+            ),
+            "pkg/cli.py": (
+                "from pkg.solver import find_energies\n"
+                "find_energies(1.0)\n"
+            ),
+        }
+        assert _check_cross_module_contracts(drafts) == []
+
+    def test_ignores_external_imports(self) -> None:
+        """Calls to numpy/scipy should not be checked."""
+        drafts = {
+            "pkg/solver.py": (
+                "import numpy as np\n"
+                "def solve():\n    return np.array([1])\n"
+            ),
+        }
+        assert _check_cross_module_contracts(drafts) == []
+
+    def test_checks_test_files_too(self) -> None:
+        """Contract checks should also catch mismatches in test call sites."""
+        drafts = {
+            "pkg/solver.py": (
+                "def find_energies(a: float, v0: float) -> list:\n"
+                "    return [1.0]\n"
+            ),
+            "tests/test_solver.py": (
+                "from pkg.solver import find_energies\n"
+                "def test_it():\n"
+                "    energies, parities = find_energies(1.0, 10.0)\n"
+            ),
+        }
+        errors = _check_cross_module_contracts(drafts)
+        assert len(errors) == 1
+        assert "find_energies" in errors[0]
+
 class TestAdvancePhaseGroundTruth:
     def test_clears_ground_truth_on_advance(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -929,11 +1075,11 @@ class TestCoderErrorContext:
         assert "CRITICAL" in prompt_sent
         assert "4 consecutive iterations" in prompt_sent
 
-    def test_revision_protects_existing_test_files(
+    def test_revision_protects_clean_test_files(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """On revision iterations with phase_error_count >= 2,
-        existing test files must not be overwritten even if the coder emits them."""
+        test files that are in clean_files must not be overwritten."""
         # The coder emits both solver.py and test_solver.py
         llm_output = (
             "```solver.py\ndef solve(): return 42\n```\n\n"
@@ -951,13 +1097,44 @@ class TestCoderErrorContext:
                 "solver.py": "def solve(): return -1\n",
                 "tests/test_solver.py": original_test,
             },
+            clean_files=["tests/test_solver.py"],
         )
         result = coder(state)
 
         # Implementation should be updated
         assert "return 42" in result["code_drafts"]["solver.py"]
-        # Test file should be PROTECTED (original preserved)
+        # Test file should be PROTECTED (it's in clean_files)
         assert result["code_drafts"]["tests/test_solver.py"] == original_test
+
+    def test_revision_allows_test_file_fixes_when_not_clean(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Test files that are NOT in clean_files should be updatable by the
+        coder, even after phase_error_count >= 2.  This ensures test infrastructure
+        bugs (e.g. wrong subprocess invocation) can be fixed."""
+        fixed_test = "import subprocess, sys\ndef run_cli(args):\n    return subprocess.run([sys.executable, '-m', 'pkg.cli'] + args, capture_output=True, text=True)\ndef test_cli(): assert run_cli(['--help']).returncode == 0\n"
+        llm_output = (
+            "```pkg/cli.py\nprint('hello')\n```\n\n"
+            f"```tests/test_cli.py\n{fixed_test}```\n"
+        )
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        buggy_test = "import subprocess, sys\ndef run_cli(args):\n    return subprocess.run([sys.executable, 'pkg/cli.py'] + args, capture_output=True, text=True)\ndef test_cli(): assert run_cli(['--help']).returncode == 0\n"
+        state = _base_state(
+            plan="fix CLI",
+            reflection="ImportError: relative import with no known parent package.",
+            _phase_error_count=3,
+            code_drafts={
+                "pkg/cli.py": "from .solver import solve\nprint('hello')\n",
+                "tests/test_cli.py": buggy_test,
+            },
+            clean_files=[],  # test_cli.py is NOT clean — all tests fail
+        )
+        result = coder(state)
+
+        # test_cli.py should be UPDATED (not protected — it's not in clean_files)
+        assert result["code_drafts"]["tests/test_cli.py"] == fixed_test
 
     def test_first_revision_allows_test_fixes(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -1281,6 +1458,111 @@ class TestCheckSyntax:
 
 
 # ---------------------------------------------------------------------------
+# pyproject.toml validation
+# ---------------------------------------------------------------------------
+
+
+class TestCheckPyprojectToml:
+    """_check_pyproject_toml should catch common pyproject.toml mistakes."""
+
+    def test_valid_pyproject_passes(self) -> None:
+        drafts = {
+            "pyproject.toml": (
+                "[build-system]\n"
+                'requires = ["hatchling"]\n'
+                'build-backend = "hatchling.build"\n\n'
+                "[project]\n"
+                'name = "my-package"\n'
+                'version = "0.1.0"\n'
+            ),
+        }
+        assert _check_pyproject_toml(drafts) == []
+
+    def test_missing_build_system(self) -> None:
+        drafts = {
+            "pyproject.toml": (
+                "[project]\n"
+                'name = "my-package"\n'
+            ),
+        }
+        errors = _check_pyproject_toml(drafts)
+        assert len(errors) == 1
+        assert "build-system" in errors[0].lower()
+
+    def test_missing_project_name(self) -> None:
+        drafts = {
+            "pyproject.toml": (
+                "[build-system]\n"
+                'requires = ["hatchling"]\n'
+                'build-backend = "hatchling.build"\n\n'
+                "[project]\n"
+                'version = "0.1.0"\n'
+            ),
+        }
+        errors = _check_pyproject_toml(drafts)
+        assert len(errors) == 1
+        assert "name" in errors[0]
+
+    def test_mixed_backends_detected(self) -> None:
+        drafts = {
+            "pyproject.toml": (
+                "[build-system]\n"
+                'requires = ["hatchling"]\n'
+                'build-backend = "hatchling.build"\n\n'
+                "[project]\n"
+                'name = "my-package"\n\n'
+                "[tool.setuptools.packages.find]\n"
+                'include = ["my_package*"]\n'
+            ),
+        }
+        errors = _check_pyproject_toml(drafts)
+        assert len(errors) == 1
+        assert "mixed" in errors[0].lower()
+
+    def test_invalid_toml_syntax(self) -> None:
+        drafts = {
+            "pyproject.toml": "[project\nname = broken",
+        }
+        errors = _check_pyproject_toml(drafts)
+        assert len(errors) == 1
+        assert "TOML" in errors[0]
+
+    def test_no_pyproject_returns_empty(self) -> None:
+        """If no pyproject.toml exists, no errors reported."""
+        drafts = {"solver.py": "x = 1\n"}
+        assert _check_pyproject_toml(drafts) == []
+
+    def test_missing_requires_and_backend(self) -> None:
+        """build-system table present but missing required keys."""
+        drafts = {
+            "pyproject.toml": (
+                "[build-system]\n"
+                'requires = ["hatchling"]\n\n'
+                "[project]\n"
+                'name = "my-package"\n'
+            ),
+        }
+        errors = _check_pyproject_toml(drafts)
+        assert len(errors) == 1
+        assert "build-backend" in errors[0]
+
+    def test_empty_build_system_reports_both_fields(self) -> None:
+        """Empty [build-system] table should report missing requires AND build-backend."""
+        drafts = {
+            "pyproject.toml": (
+                "[build-system]\n\n"
+                "[project]\n"
+                'name = "my-package"\n'
+            ),
+        }
+        errors = _check_pyproject_toml(drafts)
+        assert len(errors) == 2
+        combined = " ".join(errors)
+        assert "requires" in combined
+        assert "build-backend" in combined
+
+
+# ---------------------------------------------------------------------------
 # Stale file cleanup
 # ---------------------------------------------------------------------------
 
@@ -1356,9 +1638,9 @@ class TestPlannerReplan:
         assert len(result["plan_phases"]) == 2
         assert result["plan_phases"][1]["title"] == "CLI"
         assert result["plan_phases"][1]["description"] == "Build CLI."
-        # Phase 1 should be updated
+        # Phase 1 should be updated (description changes, title preserved)
         assert "brentq" in result["plan_phases"][0]["description"]
-        assert result["plan_phases"][0]["title"] == "Solver v2"
+        assert result["plan_phases"][0]["title"] == "Solver"  # title locked to prevent scope regression
         # Error repeat count should be reset
         assert result["_error_repeat_count"] == 0
 
@@ -1440,6 +1722,60 @@ class TestPlannerReplan:
         )
         result = planner(state)
         assert result["_replan_count"] == 2
+
+    def test_replan_skips_scaffolding_when_multi_phase(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """When the LLM returns a full multi-phase plan during replan,
+        pick the phase matching the current title, not the scaffolding."""
+        monkeypatch.chdir(tmp_path)
+        # LLM returns a full plan with scaffolding first
+        multi_phase = (
+            "## Phase 1: Scaffolding\nStub pass scaffolding files.\n"
+            "## Phase 2: Bound-State Solver\nUse brentq root finder.\nFiles: solver.py\n"
+            "## Phase 3: Wavefunctions\nCompute psi(x).\n"
+        )
+        fake = _FakeLLM(multi_phase)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        phases = [
+            {"id": 1, "title": "Scaffolding", "description": "Done.", "status": "completed", "files": []},
+            {"id": 2, "title": "Bound-State Solver", "description": "Old approach.", "status": "pending", "files": ["solver.py"]},
+        ]
+        state = _base_state(
+            plan_phases=phases,
+            current_phase=1,
+            reflection="Matrix eigenvalue approach fails.",
+            test_logs=["FAILED test_solver.py - wrong eigenvalues"],
+        )
+        result = planner(state)
+
+        # Should pick the solver phase, not scaffolding
+        assert "brentq" in result["plan_phases"][1]["description"]
+        assert result["plan_phases"][1]["title"] == "Bound-State Solver"
+        # Phase 1 should be untouched
+        assert result["plan_phases"][0]["description"] == "Done."
+
+    def test_replan_uses_raw_text_when_no_phase_headers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """When LLM outputs plain text (no ## Phase headers), use it as-is."""
+        monkeypatch.chdir(tmp_path)
+        plain_text = "Use scipy.optimize.brentq to find roots of the transcendental equation."
+        fake = _FakeLLM(plain_text)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        phases = [
+            {"id": 1, "title": "Solver", "description": "Old.", "status": "pending", "files": []},
+        ]
+        state = _base_state(
+            plan_phases=phases,
+            current_phase=0,
+            reflection="Still failing.",
+        )
+        result = planner(state)
+
+        assert "brentq" in result["plan_phases"][0]["description"]
 
 
 # ---------------------------------------------------------------------------
@@ -1565,3 +1901,228 @@ class TestNormalizePytestOutput:
     def test_handles_no_timing(self) -> None:
         raw = "SyntaxError in solver.py line 5: invalid syntax"
         assert _normalize_pytest_output(raw) == raw
+
+
+# ---------------------------------------------------------------------------
+# _resolve_duplicate_layouts
+# ---------------------------------------------------------------------------
+
+
+class TestResolveDuplicateLayouts:
+    """Auto-prune one side of flat-vs-src layout conflicts."""
+
+    def test_prunes_flat_when_new_drafts_use_src(self) -> None:
+        merged = {
+            "pkg/__init__.py": "",
+            "pkg/solver.py": "old flat code",
+            "src/pkg/__init__.py": "",
+            "src/pkg/solver.py": "new src code",
+            "tests/test_solver.py": "test code",
+        }
+        new_drafts = {"src/pkg/solver.py": "new src code"}
+        _resolve_duplicate_layouts(merged, new_drafts)
+        assert "pkg/__init__.py" not in merged
+        assert "pkg/solver.py" not in merged
+        assert "src/pkg/solver.py" in merged
+
+    def test_prunes_src_when_new_drafts_use_flat(self) -> None:
+        merged = {
+            "pkg/__init__.py": "",
+            "pkg/solver.py": "new flat code",
+            "src/pkg/__init__.py": "",
+            "src/pkg/solver.py": "old src code",
+            "tests/test_solver.py": "test code",
+        }
+        new_drafts = {"pkg/solver.py": "new flat code"}
+        _resolve_duplicate_layouts(merged, new_drafts)
+        assert "src/pkg/__init__.py" not in merged
+        assert "src/pkg/solver.py" not in merged
+        assert "pkg/solver.py" in merged
+
+    def test_no_conflict_no_change(self) -> None:
+        merged = {
+            "src/pkg/__init__.py": "",
+            "src/pkg/solver.py": "code",
+            "tests/test_solver.py": "test code",
+        }
+        original = dict(merged)
+        _resolve_duplicate_layouts(merged, {})
+        assert merged == original
+
+    def test_prefers_src_on_tie(self) -> None:
+        """When new_drafts has equal files in both layouts, prefer src/."""
+        merged = {
+            "pkg/solver.py": "flat",
+            "src/pkg/solver.py": "src",
+        }
+        new_drafts = {
+            "pkg/solver.py": "flat",
+            "src/pkg/solver.py": "src",
+        }
+        _resolve_duplicate_layouts(merged, new_drafts)
+        assert "src/pkg/solver.py" in merged
+        assert "pkg/solver.py" not in merged
+
+    def test_defaults_to_src_when_new_drafts_unrelated(self) -> None:
+        """When new_drafts has no files for conflicting pkg, default to src/."""
+        merged = {
+            "pkg/__init__.py": "",
+            "pkg/solver.py": "flat code",
+            "src/pkg/__init__.py": "",
+            "src/pkg/solver.py": "src code",
+            "tests/test_solver.py": "test code",
+        }
+        # new_drafts only touches tests, not the conflicting package
+        new_drafts = {"tests/test_solver.py": "updated test"}
+        _resolve_duplicate_layouts(merged, new_drafts)
+        assert "src/pkg/solver.py" in merged
+        assert "pkg/solver.py" not in merged
+
+
+# ---------------------------------------------------------------------------
+# Coder deletion marker
+# ---------------------------------------------------------------------------
+
+
+class TestCoderDeleteMarker:
+    """Test that coder can signal file deletion via ``# DELETE``."""
+
+    def test_delete_marker_removes_file(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Coder emitting '# DELETE' should remove the file from code_drafts."""
+        llm_output = (
+            "```old_pkg/solver.py\n"
+            "# DELETE\n"
+            "```\n"
+            "```src/pkg/solver.py\n"
+            "def solve(): pass\n"
+            "```\n"
+        )
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(
+            plan="refactor to src layout",
+            code_drafts={"old_pkg/solver.py": "old code"},
+        )
+        result = coder(state)
+
+        # old file deleted, new file present
+        assert "old_pkg/solver.py" not in result["code_drafts"]
+        assert "src/pkg/solver.py" in result["code_drafts"]
+
+    def test_delete_marker_with_whitespace(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """DELETE marker should work even with surrounding whitespace."""
+        llm_output = "```old_file.py\n  # DELETE  \n```\n"
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(
+            plan="clean up",
+            code_drafts={"old_file.py": "old code"},
+        )
+        result = coder(state)
+        assert "old_file.py" not in result["code_drafts"]
+
+
+# ---------------------------------------------------------------------------
+# Clean-file protection for source files
+# ---------------------------------------------------------------------------
+
+
+class TestCleanFileProtection:
+    """Protect all clean files (test and source) from regression during revisions."""
+
+    def test_clean_source_file_protected_on_revision(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Clean source files should not be overwritten during revisions."""
+        llm_output = (
+            "```pkg/solver.py\n"
+            "# regressed code\n"
+            "```\n"
+        )
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(
+            plan="fix wavefunctions",
+            code_drafts={"pkg/solver.py": "good code"},
+            test_logs=["FAILED tests/test_wf.py - assert False"],
+            reflection="The wavefunctions module has errors.",
+            clean_files=["pkg/solver.py"],
+            _phase_error_count=3,
+        )
+        result = coder(state)
+
+        # solver.py was clean — should keep original, not regressed version
+        assert result["code_drafts"]["pkg/solver.py"] == "good code"
+
+    def test_dirty_source_file_can_be_overwritten(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-clean source files should still be overwritable."""
+        llm_output = (
+            "```pkg/solver.py\n"
+            "# fixed code\n"
+            "```\n"
+        )
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(
+            plan="fix solver",
+            code_drafts={"pkg/solver.py": "broken code"},
+            test_logs=["FAILED tests/test_solver.py - assert False"],
+            clean_files=[],  # solver is NOT clean
+            _phase_error_count=3,
+        )
+        result = coder(state)
+
+        # solver.py was not clean — should be updated
+        assert result["code_drafts"]["pkg/solver.py"] == "# fixed code\n"
+
+
+# ---------------------------------------------------------------------------
+# _pick_replan_phase
+# ---------------------------------------------------------------------------
+
+
+class TestPickReplanPhase:
+    """Select the best phase from a replan response."""
+
+    def test_single_phase_returned_directly(self) -> None:
+        phases = [{"id": 1, "title": "Solver", "description": "Revised approach", "files": []}]
+        result = _pick_replan_phase(phases, "Bound-State Eigenvalue Solver")
+        assert result is not None
+        assert result["description"] == "Revised approach"
+
+    def test_picks_title_match_over_scaffolding(self) -> None:
+        phases = [
+            {"id": 1, "title": "Project Scaffolding", "description": "stub pass scaffolding", "files": []},
+            {"id": 2, "title": "Bound-State Eigenvalue Solver", "description": "Use brentq to find roots", "files": []},
+            {"id": 3, "title": "Wavefunctions", "description": "Compute psi(x)", "files": []},
+        ]
+        result = _pick_replan_phase(phases, "Bound-State Eigenvalue Solver")
+        assert result is not None
+        assert "brentq" in result["description"]
+
+    def test_skips_scaffolding_when_no_title_match(self) -> None:
+        phases = [
+            {"id": 1, "title": "Scaffolding", "description": "stub pass scaffolding", "files": []},
+            {"id": 2, "title": "Implementation", "description": "Real solver code", "files": []},
+        ]
+        result = _pick_replan_phase(phases, "Solver")
+        assert result is not None
+        assert result["description"] == "Real solver code"
+
+    def test_empty_phases_returns_none(self) -> None:
+        assert _pick_replan_phase([], "Solver") is None
+
+    def test_all_scaffolding_returns_last(self) -> None:
+        phases = [
+            {"id": 1, "title": "Scaffolding", "description": "stub pass scaffolding", "files": []},
+            {"id": 2, "title": "Scaffolding 2", "description": "more stub pass scaffolding", "files": []},
+        ]
+        result = _pick_replan_phase(phases, "Solver")
+        assert result is not None
+        assert result["id"] == 2

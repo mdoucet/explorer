@@ -82,3 +82,27 @@ def _even_roots(C: float) -> list[float]:
 - Test with known analytic solutions (e.g. quadratics, trig functions).
 - Verify convergence by checking residuals: `|f(x*)| < tol`.
 - Test edge cases: functions with multiple roots, flat regions, discontinuities.
+
+### Deprecated / removed APIs
+
+**CRITICAL: These common functions have been removed in recent versions.**
+Check the Environment section in the prompt for installed versions.
+
+| Removed function | Replacement | Removed in |
+|-----------------|-------------|------------|
+| `numpy.trapz()` | `scipy.integrate.trapezoid()` | NumPy 2.0 |
+| `scipy.integrate.trapz()` | `scipy.integrate.trapezoid()` | SciPy 1.14 |
+| `numpy.bool` / `numpy.int` / `numpy.float` | `bool` / `int` / `float` | NumPy 1.24 |
+| `numpy.complex` | `complex` | NumPy 1.24 |
+| `numpy.object` | `object` | NumPy 1.24 |
+| `numpy.str` | `str` | NumPy 1.24 |
+
+For numerical integration, **always** use:
+```python
+from scipy.integrate import trapezoid
+# Usage:
+result = trapezoid(y, x)
+```
+
+Do **NOT** use `np.trapz`, `numpy.trapz`, or `scipy.integrate.trapz` —
+they no longer exist in current versions.

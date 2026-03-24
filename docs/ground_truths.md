@@ -223,3 +223,200 @@ Three changes were implemented based on the run comparison findings above:
 - **Problem observed:** `MAX_ITERATIONS=0` (unlimited) allowed the schrodinger-qwen run to loop 17 times with no cap, running for 8+ hours. The process eventually died but could have gone forever.
 - **Fix:** Changed default to 20. Added `EXPLORER_MAX_ITERATIONS` env var (and `.env.example` entry) so it's configurable without code changes. CLI `--max-iterations 0` still allows explicit unlimited.
 - **Test count:** 1 new test (`test_oscillating_errors_still_trigger_replan`), 5 updated tests. Total: 135 tests passing (1 skipped).
+
+## Anti-Oscillation Improvements: 10-Point Overhaul (Based on GPT-4 Schrödinger Run Analysis)
+
+- **Problem observed:** A GPT-4 run on the Schrödinger finite-well task (`~/git/schrodinger`) ran 62 iterations, got stuck at Phase 2, and never implemented any actual physics code. The coder oscillated between two failure modes: (1) LaTeX backslashes in docstrings causing SyntaxError, and (2) function signature mismatches where the coder changed function names/params each iteration. All 62 iterations produced `pass`-stub functions.
+- **Root causes identified:** 10 systemic issues enabling the oscillation loop.
+
+### 1. Full Source on Revision Iterations
+- **File:** `src/orchestrator/nodes.py` (`coder()`)
+- **Change:** On revision iterations, the coder now receives FULL source code of all existing files (not just function signatures). Clean files are marked with ✅ and "do NOT modify". Files with errors show full source so the coder can see what needs changing.
+- **Rationale:** The coder was only seeing signatures, so it re-invented function bodies from scratch each iteration, losing all prior partial fixes.
+
+### 2. Verified Fixes (Cumulative Constraints)
+- **Files:** `src/orchestrator/nodes.py` (`coder()`, `verifier()`), `src/orchestrator/state.py`
+- **Change:** When a previously-failing syntax check passes (e.g., raw docstring fix), the verifier records it as a permanent "verified fix" constraint. The coder receives these as "MANDATORY constraints" that must not be violated.
+- **New state fields:** `verified_fixes: list[str]`, `_prev_syntax_file_count: int`
+- **Rationale:** The coder kept re-introducing LaTeX backslashes that had been fixed in prior iterations because it had no memory of validated fixes.
+
+### 3. Clean File Tracking
+- **Files:** `src/orchestrator/nodes.py` (`verifier()`, `coder()`), `src/orchestrator/state.py`
+- **Change:** The verifier identifies files with zero syntax/import errors and marks them as "clean". The coder is told not to modify files marked ✅.
+- **New state field:** `clean_files: list[str]`
+- **Rationale:** The coder was modifying working files, re-introducing bugs into previously clean code.
+
+### 4. Replan Scope Locking
+- **File:** `src/orchestrator/nodes.py` (`planner()`)
+- **Change:** During replans, the original phase title is preserved (not replaced by the LLM's new title). The replan prompt explicitly says "Do NOT regress the scope" and "MUST remain [original title]".
+- **Rationale:** Replans could regress from "Implement Solver" back to "Project Scaffolding", losing all implementation work.
+
+### 5. Per-Phase Iteration Cap
+- **File:** `src/cli.py`
+- **Change:** Added `MAX_PHASE_ITERATIONS=8`. If a single phase exceeds this many iterations, the graph force-advances to the next phase instead of continuing to loop.
+- **Rationale:** The GPT-4 run spent all 62 iterations on a single phase. Even if the phase isn't fully solved, moving forward allows progress on other phases that may be easier.
+
+### 6. Exponential Backoff on Replans
+- **File:** `src/cli.py` (`_after_reflector()`)
+- **Change:** The replan threshold now uses exponential backoff: 3 errors for first replan, 6 for second, etc. (`REPLAN_THRESHOLD * 2^replan_count`).
+- **Rationale:** Fixed threshold triggered replans too frequently, not giving the coder enough time to self-correct after each replan.
+
+### 7. LaTeX Backslash Ban in Coder Prompt
+- **File:** `prompts/coder.md`
+- **Change:** Added explicit "Docstring safety" section: "NEVER use backslash-prefixed LaTeX commands in docstrings" with guidance to use raw docstrings or plain text.
+- **Rationale:** LaTeX backslashes (`\psi`, `\hbar`, `\frac`) were the #1 cause of SyntaxError in the GPT-4 run, recurring in every iteration.
+
+### 8. Source Code in Reflector Context
+- **Files:** `src/orchestrator/nodes.py` (`reflector()`), `prompts/reflector.md`
+- **Change:** The reflector now receives the source code of files with errors (non-clean files), not just test logs. The prompt instructs it to "reference EXACT line numbers and variable names from the code."
+- **Rationale:** The reflector was giving generic debugging advice because it couldn't see the actual implementation code.
+
+### 9. Best Iteration Tracking & Rollback
+- **Files:** `src/orchestrator/nodes.py` (`verifier()`), `src/orchestrator/state.py`
+- **Change:** The verifier tracks the code snapshot with the fewest errors (`best_code_drafts`, `best_error_count`). If error count worsens for 3+ iterations in a row while the coder oscillates, it reverts to the best-known snapshot.
+- **Rationale:** The coder's oscillation pattern meant it would fix one bug but introduce two, then fix those but re-introduce the original. Rollback to the best known state prevents regression.
+
+### 10. Streaming LLM Invocation with Retry
+- **File:** `src/orchestrator/nodes.py` (`_invoke_llm()`)
+- **Change:** Added `_invoke_llm()` helper that uses `llm.stream()` with retry on transient errors (incomplete chunked reads, connection drops, timeouts). All four LLM call sites (planner, coder, reflector x2) now use this helper. Falls back to `invoke()` for test mocks.
+- **Rationale:** The server proxy at forerunner.ornl.gov dropped connections that didn't produce a token within ~60s. Large prompts (planner, coder) need streaming to avoid first-byte timeout.
+
+### Test Impact
+- 1 test updated (`test_replan_updates_current_phase_only` — title now preserved as "Solver" instead of "Solver v2")
+- Total: 135 tests passing (1 skipped).
+
+## GPT-4 Schrödinger Run: Force-Advance + Deprecated API Issues (March 2026)
+
+- **Run:** `~/git/schrodinger`, GPT-4, 20 iterations, 4 phases. Completed ~7.5 minutes (16:13–16:21 UTC).
+- **Outcome:** Phases 1–3 completed (1 passed, 2–3 force-advanced), Phase 4 hit MAX_ITERATIONS. Final: tests failing on `ImportError: cannot import name 'trapz' from 'numpy'`.
+
+### Issue 1: Force-advance propagated broken code across phases
+- **Problem:** Phase 2 (solver) was force-advanced after 8 iterations with 3 failing tests — wrong eigenvalues (actual: [-46.84, -35.48, -25.0] vs expected: [-43.32, -17.65, -2.09]), phantom bound states, and near-pole handling. Phase 3 (wavefunctions) inherited this broken solver AND introduced its own `trapz` import bug. Phase 3 was also force-advanced after 8 iterations. Phase 4 (CLI) inherited BOTH bugs — couldn't even collect tests.
+- **Root cause:** `_should_continue()` force-advanced on `_phase_iteration_count >= MAX_PHASE_ITERATIONS` regardless of error severity. Collection errors (0 tests ran) indicate fundamentally broken code that can't improve by simply moving to the next phase.
+- **Fix:** Added `_collection_error` flag to state. The verifier detects collection errors (`"collected 0 items"` or `"error during collection"` in pytest output). The force-advance logic in `_should_continue()` now blocks force-advance when `_collection_error` is True — the agent must fix the import/collection error before progressing.
+- **New state field:** `_collection_error: bool`, reset on `advance_phase`.
+
+### Issue 2: `numpy.trapz` and `scipy.integrate.trapz` both removed
+- **Problem:** The coder used `from numpy import trapz` (removed in NumPy 2.0). The reflector suggested `from numpy import integrate` (doesn't exist). The planner suggested `np.trapz` (also removed). Then `scipy.integrate.trapz` (removed in SciPy 1.14). None knew the correct API: `scipy.integrate.trapezoid`. This continued for **16 iterations** across Phases 3–4.
+- **Root cause:** Neither the coder, reflector, nor planner had any awareness of which library versions were installed (numpy 2.4.1, scipy 1.17.0) or which APIs had been deprecated/removed.
+- **Fix 1 — Environment info injection:** Added `_get_environment_info()` helper that runs `pip list --format=freeze` once per run (cached) and extracts versions of key packages (numpy, scipy, matplotlib, click, pytest). This is injected into the coder's prompt as a `## Environment` section so the LLM knows what's available.
+- **Fix 2 — Deprecated API table in skill:** Added a "Deprecated / removed APIs" section to `skills/numerical-optimization/SKILL.md` with a table of common removals: `numpy.trapz → scipy.integrate.trapezoid`, `scipy.integrate.trapz → scipy.integrate.trapezoid`, `numpy.bool/int/float/complex → builtins`. Includes explicit "Do NOT use" warnings and correct replacement code.
+
+### Issue 3: Reflector poisoned ground truth
+- **Problem:** The reflector recorded the incorrect finding "The ImportError occurs because `trapz` should be imported from `numpy.integrate`, not directly from `numpy`." This is factually wrong — numpy has no `integrate` submodule. The wrong finding was fed back to the coder via ground_truth, reinforcing the incorrect approach.
+- **Mitigation:** The environment info injection (Fix 1 above) and skill deprecation table (Fix 2) should prevent this class of error by giving the LLM correct information upfront. A full "validate reflector suggestions" system is deferred.
+
+### Test Impact
+- All 135 tests still pass (1 skipped). No test changes needed — the new `_collection_error` field and `_get_environment_info()` are additive.
+
+## State Management: Code Drafts (2025-07)
+
+### Problem: Purely Additive Merge Causes Layout Conflicts
+- **Root cause:** The coder's merge logic `merged_drafts = dict(existing); merged_drafts.update(new)` is purely additive — files can enter `code_drafts` but never leave. When the planner switches from flat (`pkg/`) to `src/pkg/` layout, old flat files persist forever.
+- **Evidence from schrodinger run:** Both `square_well/solver.py` (167 lines, full implementation) and `src/square_well/solver.py` (24 lines, stub) coexisted. `_check_duplicate_modules()` detected it as an error but the coder couldn't resolve it because it had no deletion mechanism. This caused an unresolvable loop for 16+ iterations.
+- **`_warn_stale_files()` was ineffective:** It removes disk files not in `code_drafts`, but since `code_drafts` grows monotonically, it never detected the stale flat-layout files.
+
+### Fix 1: Auto-resolve duplicate layouts (`_resolve_duplicate_layouts`)
+- New helper called after the coder merge step. When the same package exists in both flat (`pkg/`) and `src/pkg/` layouts, it determines which layout `new_drafts` prefers (by counting files) and prunes the other from `merged_drafts`. On ties, prefers `src/` (modern convention). Stale files are also removed from disk in write mode.
+
+### Fix 2: Explicit file deletion via `# DELETE` marker
+- If the coder emits a code block with just `# DELETE` as content, the file is removed from `code_drafts` and deleted from disk. This gives the LLM a first-class way to remove obsolete files during restructuring.
+- Documented in `prompts/coder.md` with example syntax.
+
+### Fix 3: Clean source-file protection during revisions
+- Previously only test files were protected from accidental overwrite (after `_phase_error_count >= 2`). Now clean non-test source files (those with no syntax/import errors, marked ✅ in the prompt) are also protected. This prevents the coder from regressing working solver code while fixing unrelated wavefunction errors.
+- Protection only applies during revision iterations (non-empty `reflection`) and only after `phase_errors >= 2`, giving the coder initial freedom to make changes.
+
+### Test Impact
+- 143 tests pass (was 135). Added 8 new tests covering `_resolve_duplicate_layouts` (4 tests), deletion marker (2 tests), and clean-file protection (2 tests).
+
+## Replan Bug: Scaffolding Regression (2025-07)
+
+### Problem: Replan Replaces Implementation Phase with Scaffolding
+- **Root cause:** During replanning, the planner uses the same system prompt that asks for a full `## Phase 1` / `## Phase 2` / etc. multi-phase plan. The LLM generates a fresh plan starting with scaffolding (Phase 1). The code then takes `new_phases[0]` (the scaffolding phase) and uses its description to replace the current phase — overwriting the solver/implementation description with scaffolding instructions.
+- **Evidence from schrodinger run (2025-03-24):** Both replans for Phase 2 (iterations 14 and 24) produced "Establish the project structure, package layout, and stub out all modules" instead of a revised solver approach. This wasted both replan attempts and directly contributed to Phase 2 being force-advanced with failing tests.
+- **Impact:** Phase 2's description was replaced with scaffolding instructions. The coder received scaffolding instructions where it should have received a revised solver algorithm. Two replan opportunities were wasted.
+
+### Fix 1: Dedicated replan prompt (`prompts/planner_replan.md`)
+- New system prompt specifically for replanning that instructs the LLM to output ONLY a single revised phase description, not a full multi-phase plan. Tells it explicitly: "Do NOT output a full multi-phase plan. Do NOT start over with scaffolding."
+- Loaded via `EXPLORER_PROMPT_PLANNER_REPLAN` env var, falling back to `planner_replan.md`.
+
+### Fix 2: Smart phase selection (`_pick_replan_phase`)
+- New helper that handles the case where the LLM still outputs multi-phase plans during replan. Selection priority:
+  1. If only one phase parsed, use it.
+  2. If multiple, prefer the one whose title matches the current phase (case-insensitive substring).
+  3. Skip scaffolding phases (contain "stub" + "pass" + "scaffolding" in title).
+  4. Fall back to first non-scaffolding phase, or last phase if all are scaffolding.
+
+### Additional Finding: Duplicate Layout Still in Plan Artifact
+- Even though no `src/` directory was created on disk (layout resolver working), the replanned Phase 2 description still references `src/square_well/` file paths. This is cosmetic (the coder prompt and layout resolver handle it), but the plan.md artifact is confusing.
+
+### Test Impact
+- 151 tests pass (was 143). Added 7 new tests: `_pick_replan_phase` (5 tests) and planner replan integration (2 tests).
+
+## Test Protection: Unified Clean-Files Criterion (2025-07)
+
+### Problem: Test Files with Bugs Were Unconditionally Protected
+- **Root cause:** The coder's test protection logic unconditionally protected ALL `test_*.py` files when `_phase_error_count >= 2`, regardless of whether those test files had passing or failing tests. Source file protection, by contrast, correctly used `clean_files` — only protecting files with zero errors.
+- **Evidence from schrodinger GPT-4 run (2025-03-24):** Phase 4 (CLI) was stuck for 44 iterations (36–80) on `ImportError: attempted relative import with no known parent package`. The test file `tests/test_cli.py` contained a buggy `run_cli()` helper that initialized a correct `python -m square_well.cli` invocation but then overwrote it with `python square_well/cli.py` (direct script execution). The reflector correctly identified the fix every single iteration, but the coder could not apply it because:
+  1. The test file was protected from modification (test protection kicked in at `_phase_error_count >= 2`)
+  2. The coder kept regenerating `cli.py` with relative imports (`from .solver import ...`), which is correct for module execution but fails with direct script execution
+- **Impact:** 44 wasted iterations. The reflector's correct fix ("change to absolute imports in cli.py") was ignored by the coder, and the alternative fix ("change test to use `python -m`") was blocked by test protection.
+
+### Fix: Unified Protection Using `clean_files`
+- Changed test protection from unconditional (`test_*.py` → protected) to clean-files-based (`file in clean_files` → protected). Now both test files and source files use the same criterion: only files verified as having zero errors are protected.
+- **Behavior change:**
+  - Test files with ALL tests passing: Still protected (in `clean_files`) ✅
+  - Test files with ANY test failing: Not protected, coder can fix them ✅
+  - Source files with no errors: Still protected (in `clean_files`) ✅
+  - Source files with errors: Not protected, coder can fix them ✅
+- **Risk assessment:** A test file with 4/5 passing tests won't be in `clean_files` (requires zero errors), so the coder could theoretically weaken passing tests. However: (a) the reflector's guidance steers toward fixing the failing test, not weakening others, (b) the `phase_errors >= 2` gate still gives the coder initial freedom before any protection, and (c) the alternative (44-iteration stuck loops) is far worse.
+
+### Test Impact
+- Updated `test_revision_protects_existing_test_files` → `test_revision_protects_clean_test_files` (now requires `clean_files` to contain the test file for protection).
+- Added `test_revision_allows_test_file_fixes_when_not_clean` (test files NOT in `clean_files` can be updated by the coder even after `_phase_error_count >= 2`).
+
+## Cross-Module Contract Checking (2025-07)
+
+### Problem: Interface Mismatches Between Modules Not Caught Before Pytest
+- **Root cause:** The verifier's pre-test checks (`_check_import_consistency`, `_check_duplicate_modules`, `_check_syntax`) only validated that imported **names** exist. They did not check that function **signatures** (argument count, return type) match between definitions and call sites. Each module's unit tests pass individually, but the modules fail when combined.
+- **Evidence from schrodinger GPT-4 run (2025-03-24):** Three post-run fixes were needed:
+  1. Click `--V0` becomes parameter `v0` (lowercase) — convention mismatch
+  2. `find_bound_energies()` returned `energies` but CLI expected `(energies, parities)` — return value contract mismatch
+  3. Tests needed updating to unpack the new return tuple — cascading interface change
+- **Impact:** All three bugs survived to the end of the run because unit tests passed in isolation.
+
+### Fix 1: `_check_cross_module_contracts()` — AST-based contract validation
+- New pre-test check added to the verifier pipeline (runs after import consistency, before pytest).
+- Builds a map of all function definitions with their AST nodes across source modules.
+- For each call to an imported function, checks:
+  1. **Argument count:** Positional arg count at call site vs min/max params in definition (respects defaults, `*args`).
+  2. **Return-value unpacking:** If caller does `a, b = func()`, checks that the function's return statements consistently return a tuple of the same length. Detects both over-unpacking (caller expects 2, function returns 1) and under-unpacking (caller assigns to single variable, function returns tuple of 2).
+- Helper functions: `_build_module_definitions()` (shared with `_check_import_consistency`), `_count_return_elements()`, `_min_positional_args()`, `_max_positional_args()`, `_check_return_unpacking()`.
+
+### Fix 2: Click CLI guidance in coder prompt and python-testing skill
+- Added to `prompts/coder.md`: Warning about Click lowercasing option names, recommendation to use lowercase options or explicit param names, and module invocation for CLI tests.
+- Added to `skills/python-testing/SKILL.md`: New "CLI testing with Click" section and "Cross-module interface consistency" section. Extended pitfalls table with Click, relative import, and return value mismatch entries.
+
+### Fix 3: Interface consistency guidance in coder prompt
+- Added "Cross-module consistency" section to `prompts/coder.md`: When changing return types, update ALL callers. When adding parameters, update all call sites.
+
+## pyproject.toml Validation (2025-07)
+
+### Problem: Broken pyproject.toml Causes Silent `pip install -e .` Failures
+- **Root cause:** The coder prompt said "generate a minimal pyproject.toml with [project] and dependencies" but didn't require `[build-system]`. LLMs frequently omit it, or mix build backends (e.g. `[tool.setuptools.packages.find]` with `build-backend = "hatchling.build"`). Without `[build-system]`, `pip install -e .` falls back to legacy setuptools behavior and fails. The verifier's `_ensure_importable()` silently fell through to conftest-based sys.path fallback, masking the issue.
+- **Evidence from schrodinger GPT-4 run (2025-03-24):** The generated pyproject.toml had no `[build-system]`, mixed `[tool.setuptools.packages.find]` with `[tool.hatch.build.targets.wheel]`, and `pip install -e .` failed with a traceback.
+- **Additional finding:** The python-testing skill template had `build-backend = "hatchling.backends"` (wrong) instead of `"hatchling.build"` (correct).
+
+### Fix 1: `_check_pyproject_toml()` — pre-test validator
+- New verifier pre-check that runs before syntax checks. Validates:
+  1. `[build-system]` table exists with `requires` and `build-backend`.
+  2. `[project]` table exists with `name`.
+  3. No mixed backend configuration (setuptools config with hatchling backend, or vice versa).
+  4. Valid TOML syntax.
+- Errors are reported as actionable messages that tell the LLM exactly what to add.
+
+### Fix 2: Prescriptive pyproject.toml template in prompts and skills
+- Updated `prompts/coder.md`: Replaced "generate a minimal pyproject.toml" with an exact copy-paste template including `[build-system]`, `[project]`, and explicit warnings.
+- Updated `skills/python-testing/SKILL.md`: Replaced vague template with mandatory template, added rules section, fixed `hatchling.backends` → `hatchling.build`.
+- Updated `prompts/planner.md`: Phase 1 scaffolding requirement now explicitly mentions `[build-system]` (hatchling) alongside `[project]`.

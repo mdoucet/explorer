@@ -27,7 +27,7 @@ Files: file1.py, file2.py
 
 Rules for phasing:
 - **Phase 1 MUST be scaffolding only.**  It must contain:
-  - `pyproject.toml` with dependencies
+  - `pyproject.toml` with `[build-system]` (hatchling), `[project]` name and dependencies
   - Package layout with `__init__.py` files
   - All source modules as **stubs** — function signatures with `pass` bodies
   - Test files with trivial assertions (`assert True`) that verify imports work

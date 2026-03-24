@@ -89,6 +89,46 @@ def get_llm() -> ChatOpenAI | ChatOllama:
     return _llm
 
 
+def _invoke_llm(llm: Any, messages: list, *, max_retries: int = 3, retry_delay: float = 5.0) -> Any:
+    """Invoke the LLM with streaming and retry on transient errors.
+
+    Uses ``llm.stream()`` to avoid first-byte timeouts on large prompts
+    (the server proxy drops connections that don't produce a token within
+    ~60s).  Falls back to ``llm.invoke()`` for test mocks that don't
+    support streaming.
+    """
+    if not hasattr(llm, "stream"):
+        return llm.invoke(messages)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            chunks: list[Any] = []
+            for chunk in llm.stream(messages):
+                chunks.append(chunk)
+            if not chunks:
+                return llm.invoke(messages)
+            result = chunks[0]
+            for c in chunks[1:]:
+                result = result + c
+            return result
+        except Exception as exc:
+            err_str = str(exc).lower()
+            transient = any(k in err_str for k in (
+                "incomplete chunked read", "peer closed", "connection",
+                "timeout", "502", "503", "504", "remotedisconnected",
+                "remoteprotocolerror",
+            ))
+            if transient and attempt < max_retries:
+                logger.warning(
+                    "Transient LLM error (attempt %d/%d): %s — retrying in %.0fs",
+                    attempt, max_retries, exc, retry_delay,
+                )
+                import time
+                time.sleep(retry_delay)
+                continue
+            raise
+
+
 # ---------------------------------------------------------------------------
 # Plan phase helpers
 # ---------------------------------------------------------------------------
@@ -165,6 +205,53 @@ def _write_plan_artifact(phases: list[dict[str, Any]], current: int) -> None:
     Path("plan.md").write_text("\n".join(lines))
 
 
+def _pick_replan_phase(
+    new_phases: list[dict[str, Any]], target_title: str
+) -> dict[str, Any] | None:
+    """Select the best phase from a replan response.
+
+    During replanning we ask the LLM for a single revised phase, but it may
+    still emit a full multi-phase plan.  This helper picks the right one:
+
+    1. If only one phase was parsed, return it.
+    2. If multiple phases, prefer the one whose title best matches
+       *target_title* (case-insensitive substring).
+    3. Skip any phase whose description looks like pure scaffolding
+       (contains "stub" + "pass" and no algorithm content).
+    4. Fall back to the first non-scaffolding phase, or the first phase.
+    """
+    if not new_phases:
+        return None
+    if len(new_phases) == 1:
+        return new_phases[0]
+
+    target_lower = target_title.lower()
+
+    # Try title match first
+    for phase in new_phases:
+        if target_lower in phase["title"].lower():
+            return phase
+
+    # Filter out scaffolding phases
+    non_scaffold: list[dict[str, Any]] = []
+    for phase in new_phases:
+        desc = phase["description"].lower()
+        is_scaffolding = (
+            "stub" in desc
+            and "pass" in desc
+            and "scaffolding" in phase["title"].lower()
+        )
+        if not is_scaffolding:
+            non_scaffold.append(phase)
+
+    if non_scaffold:
+        return non_scaffold[0]
+
+    # All phases look like scaffolding — return last one (most likely
+    # to contain implementation content)
+    return new_phases[-1]
+
+
 # ---------------------------------------------------------------------------
 # 1. Planner
 # ---------------------------------------------------------------------------
@@ -196,10 +283,15 @@ def planner(state: ScientificState) -> dict[str, Any]:
         phases = state["plan_phases"]
         current = state.get("current_phase", 0)
         phase = phases[current]
+        original_title = phase["title"]
         user_parts.append(
-            f"## ⚠️ REPLAN REQUEST — Phase {phase['id']}: {phase['title']}\n"
+            f"## ⚠️ REPLAN REQUEST — Phase {phase['id']}: {original_title}\n"
             f"The coder has been stuck on this phase for multiple iterations "
             f"with the same error.  Revise the plan for THIS phase only.\n\n"
+            f"**IMPORTANT: Do NOT regress the scope.** The phase title MUST "
+            f"remain \"{original_title}\". Do NOT change it back to scaffolding "
+            f"or reduce the scope.  Suggest a DIFFERENT implementation "
+            f"approach for the same deliverables.\n\n"
             f"**Current phase description:**\n{phase['description']}\n\n"
             f"**Error analysis from reflector:**\n{state['reflection']}"
         )
@@ -210,9 +302,15 @@ def planner(state: ScientificState) -> dict[str, Any]:
     if state.get("skills_context"):
         user_parts.append(state["skills_context"])
 
-    prompt = _load_prompt("EXPLORER_PROMPT_PLANNER", "planner.md")
+    # Use a dedicated replan prompt that asks for a SINGLE revised phase,
+    # not a full multi-phase plan.  This prevents the LLM from regenerating
+    # scaffolding when it should be revising the solver/implementation.
+    if is_replan:
+        prompt = _load_prompt("EXPLORER_PROMPT_PLANNER_REPLAN", "planner_replan.md")
+    else:
+        prompt = _load_prompt("EXPLORER_PROMPT_PLANNER", "planner.md")
     user_message = "\n\n".join(user_parts)
-    response = llm.invoke([
+    response = _invoke_llm(llm, [
         SystemMessage(content=prompt),
         HumanMessage(content=user_message),
     ])
@@ -223,13 +321,16 @@ def planner(state: ScientificState) -> dict[str, Any]:
         # Only update the current phase description — keep other phases intact
         phases = list(state["plan_phases"])
         current = state.get("current_phase", 0)
+        original_title = phases[current]["title"]
         new_phases = _parse_plan_phases(raw_plan)
-        # Use the first phase from the re-plan as the revised current phase
-        if new_phases:
-            phases[current]["description"] = new_phases[0]["description"]
-            phases[current]["title"] = new_phases[0]["title"]
-            if new_phases[0].get("files"):
-                phases[current]["files"] = new_phases[0]["files"]
+        # Try to find a phase matching the current title (case-insensitive)
+        best = _pick_replan_phase(new_phases, original_title)
+        if best:
+            phases[current]["description"] = best["description"]
+            # Preserve the original title to prevent scope regression
+            phases[current]["title"] = original_title
+            if best.get("files"):
+                phases[current]["files"] = best["files"]
         plan_text = phases[current]["description"]
         _write_plan_artifact(phases, current)
         return {
@@ -289,6 +390,13 @@ def advance_phase(state: ScientificState) -> dict[str, Any]:
         "_error_repeat_count": 0,
         "_replan_count": 0,
         "_phase_error_count": 0,
+        "_phase_iteration_count": 0,
+        "_prev_syntax_file_count": 0,
+        "_collection_error": False,
+        "verified_fixes": [],
+        "clean_files": [],
+        "best_code_drafts": {},
+        "best_error_count": -1,
     }
 
 
@@ -349,6 +457,39 @@ def _write_code_drafts(
         target.write_text(source)
 
 
+# Cache environment info — doesn't change during a run
+_env_info_cache: str | None = None
+
+
+def _get_environment_info() -> str:
+    """Return a short summary of the Python environment (version + key packages).
+
+    Cached after the first call since the environment doesn't change mid-run.
+    """
+    global _env_info_cache  # noqa: PLW0603
+    if _env_info_cache is not None:
+        return _env_info_cache
+
+    lines = [f"Python {sys.version.split()[0]}"]
+    try:
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-m", "pip", "list", "--format=freeze"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            # Pick key scientific packages
+            interesting = {"numpy", "scipy", "matplotlib", "click", "pytest"}
+            for line in result.stdout.splitlines():
+                pkg = line.split("==")[0].lower()
+                if pkg in interesting:
+                    lines.append(line.strip())
+    except Exception:
+        pass
+
+    _env_info_cache = "\n".join(lines)
+    return _env_info_cache
+
+
 def coder(state: ScientificState) -> dict[str, Any]:
     """Generate Python source code from the current plan phase.
 
@@ -372,9 +513,24 @@ def coder(state: ScientificState) -> dict[str, Any]:
         f"## Current Phase ({current + 1} of {total}): {phase_title}\n{state['plan']}",
     ]
 
+    # Inject Python environment info so the coder knows available library versions
+    env_info = _get_environment_info()
+    if env_info:
+        user_parts.append(f"## Environment\n{env_info}")
+
+    # Inject verified fixes as non-negotiable constraints
+    verified_fixes = state.get("verified_fixes") or []
+    if verified_fixes:
+        rules = "\n".join(f"- {f}" for f in verified_fixes)
+        user_parts.append(
+            f"## ⚠️ MANDATORY CONSTRAINTS (verified from prior iterations)\n"
+            f"These rules have been validated.  You MUST follow them:\n{rules}"
+        )
+
     # If we have error context from a previous iteration, show the coder
     # what went wrong so it can fix its own mistakes directly.
-    if state.get("reflection"):
+    is_revision = bool(state.get("reflection"))
+    if is_revision:
         error_repeat = state.get("_error_repeat_count", 0)
         if error_repeat >= 3:
             user_parts.append(
@@ -391,28 +547,53 @@ def coder(state: ScientificState) -> dict[str, Any]:
             f"## Test failures to fix\n```\n{log_text}\n```"
         )
 
-    # Inform coder about files that already exist from prior phases
+    # Inform coder about files that already exist from prior phases.
+    # On revision iterations, show FULL source so the coder can see
+    # exactly what needs changing.  On first pass, show signatures only.
     existing_drafts = state.get("code_drafts") or {}
     if existing_drafts:
-        sig_lines: list[str] = []
-        for fpath in sorted(existing_drafts.keys()):
-            sigs = _extract_signatures(existing_drafts[fpath])
-            if sigs:
-                sig_lines.append(f"### {fpath}\n" + "\n".join(sigs))
-            else:
-                sig_lines.append(f"### {fpath}")
-        user_parts.append(
-            "## Existing files from prior phases\n"
-            "These files already exist and can be imported.  Use the "
-            "exact names shown below when importing.\n\n"
-            + "\n\n".join(sig_lines)
-        )
+        if is_revision:
+            # Full source context for revisions — the coder needs to see
+            # its own code to fix specific lines.
+            clean = set(state.get("clean_files") or [])
+            source_parts: list[str] = []
+            for fpath in sorted(existing_drafts.keys()):
+                if fpath in clean:
+                    source_parts.append(
+                        f"### {fpath} ✅ (NO ERRORS — do NOT modify)\n"
+                        f"```python\n{existing_drafts[fpath]}\n```"
+                    )
+                else:
+                    source_parts.append(
+                        f"### {fpath}\n"
+                        f"```python\n{existing_drafts[fpath]}\n```"
+                    )
+            user_parts.append(
+                "## Your current source files\n"
+                "Files marked ✅ have no errors — do NOT regenerate them.\n"
+                "Fix ONLY the files with errors.\n\n"
+                + "\n\n".join(source_parts)
+            )
+        else:
+            sig_lines: list[str] = []
+            for fpath in sorted(existing_drafts.keys()):
+                sigs = _extract_signatures(existing_drafts[fpath])
+                if sigs:
+                    sig_lines.append(f"### {fpath}\n" + "\n".join(sigs))
+                else:
+                    sig_lines.append(f"### {fpath}")
+            user_parts.append(
+                "## Existing files from prior phases\n"
+                "These files already exist and can be imported.  Use the "
+                "exact names shown below when importing.\n\n"
+                + "\n\n".join(sig_lines)
+            )
 
     if state.get("skills_context"):
         user_parts.append(state["skills_context"])
 
     user_message = "\n\n".join(user_parts)
-    response = llm.invoke([
+    response = _invoke_llm(llm, [
         SystemMessage(content=prompt),
         HumanMessage(content=user_message),
     ])
@@ -420,22 +601,25 @@ def coder(state: ScientificState) -> dict[str, Any]:
     raw_content = response.content
     new_drafts = _parse_code_blocks(raw_content)
 
-    # On revision iterations, protect existing test files ONLY after the
-    # coder has already had one chance to fix them (_phase_error_count >= 2).
-    # This lets the coder correct genuinely wrong tests it wrote on the first
-    # pass of a new phase, while still preventing it from weakening tests to
-    # match broken implementation code on subsequent iterations.
-    # NOTE: We use _phase_error_count (total failures in this phase) rather
-    # than _error_repeat_count (consecutive identical failures) because the
-    # coder often oscillates between different errors each iteration, making
-    # the repeat count stay at 1 forever.
-    is_revision = bool(state.get("reflection"))
+    # Handle explicit deletion markers: if coder emits "# DELETE" as the
+    # sole content of a code block, it signals that file should be removed.
+    _DELETE_MARKER = "# DELETE"
+    deletions: set[str] = set()
+    for fp, content in list(new_drafts.items()):
+        if content.strip() == _DELETE_MARKER:
+            deletions.add(fp)
+            del new_drafts[fp]
+
+    # On revision iterations, protect files that are verified clean ONLY
+    # after the coder has already had one chance to fix (_phase_error_count >= 2).
+    # Both test files and source files use the same criterion: only protect
+    # files present in clean_files (all tests passing, no errors).
+    # This ensures test files with bugs (e.g. wrong subprocess invocation)
+    # can still be fixed while truly passing test files remain untouched.
     phase_errors = state.get("_phase_error_count", 0)
     if is_revision and existing_drafts and phase_errors >= 2:
-        protected = {
-            fp for fp in existing_drafts
-            if fp.rpartition("/")[2].startswith("test_")
-        }
+        clean = set(state.get("clean_files") or [])
+        protected = {fp for fp in clean if fp in existing_drafts}
         for fp in protected:
             new_drafts.pop(fp, None)
 
@@ -443,10 +627,28 @@ def coder(state: ScientificState) -> dict[str, Any]:
     merged_drafts = dict(existing_drafts)
     merged_drafts.update(new_drafts)
 
-    # In write mode, persist files to the output directory
+    # Apply explicit deletions
+    for fp in deletions:
+        merged_drafts.pop(fp, None)
+
+    # Auto-resolve duplicate layouts (flat vs src/).
+    # If both exist, keep whichever layout the new_drafts prefer.
+    _resolve_duplicate_layouts(merged_drafts, new_drafts)
+
+    # In write mode, persist files and clean up deleted/pruned files
     output_dir = state.get("output_dir", "")
     if output_dir:
         _write_code_drafts(new_drafts, output_dir)
+        # Remove any files that were deleted or pruned from disk
+        root = Path(output_dir).resolve()
+        all_removed = deletions | (
+            (set(existing_drafts) | set(new_drafts)) - set(merged_drafts)
+        )
+        for fp in all_removed:
+            target = (root / fp).resolve()
+            if target.is_relative_to(root) and target.exists():
+                logger.warning("Removing file from disk: %s", fp)
+                target.unlink()
 
     return {"code_drafts": merged_drafts, "coder_raw_response": raw_content, "_prompt_summary": user_message}
 
@@ -625,19 +827,20 @@ def _ensure_importable(root: Path, code_drafts: dict[str, str]) -> None:
     )
 
 
-def _check_import_consistency(code_drafts: dict[str, str]) -> list[str]:
-    """Check that names imported in test files are actually defined in source modules.
+def _build_module_definitions(
+    code_drafts: dict[str, str],
+) -> tuple[dict[str, set[str]], dict[str, dict[str, ast.FunctionDef]]]:
+    """Build maps of module-level names and function AST nodes.
 
-    Returns a list of human-readable error strings (empty if consistent).
-    Only checks ``from <module> import <name>`` statements in test files
-    against top-level definitions in non-test ``.py`` files.
+    Returns ``(defined, func_defs)`` where:
+    - *defined*: ``{dotted_module: {name, ...}}``
+    - *func_defs*: ``{dotted_module: {func_name: FunctionDef_node, ...}}``
     """
-    # Build a map: module_dotted_path -> set of top-level names defined
     defined: dict[str, set[str]] = {}
+    func_defs: dict[str, dict[str, ast.FunctionDef]] = {}
     for fpath, source in code_drafts.items():
         if not fpath.endswith(".py"):
             continue
-        # Skip test files and __init__.py
         basename = fpath.rsplit("/", 1)[-1] if "/" in fpath else fpath
         if basename.startswith("test_") or basename == "__init__.py":
             continue
@@ -646,9 +849,11 @@ def _check_import_consistency(code_drafts: dict[str, str]) -> list[str]:
         except SyntaxError:
             continue
         names: set[str] = set()
+        funcs: dict[str, ast.FunctionDef] = {}
         for node in ast.iter_child_nodes(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 names.add(node.name)
+                funcs[node.name] = node
             elif isinstance(node, ast.ClassDef):
                 names.add(node.name)
             elif isinstance(node, ast.Assign):
@@ -657,12 +862,24 @@ def _check_import_consistency(code_drafts: dict[str, str]) -> list[str]:
                         names.add(t.id)
             elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
                 names.add(node.target.id)
-        # Convert file path to dotted module path
         mod_path = fpath.removesuffix(".py").replace("/", ".")
-        # Also store without leading "src." for src-layout projects
         defined[mod_path] = names
+        func_defs[mod_path] = funcs
         if mod_path.startswith("src."):
-            defined[mod_path.removeprefix("src.")] = names
+            short = mod_path.removeprefix("src.")
+            defined[short] = names
+            func_defs[short] = funcs
+    return defined, func_defs
+
+
+def _check_import_consistency(code_drafts: dict[str, str]) -> list[str]:
+    """Check that names imported in test files are actually defined in source modules.
+
+    Returns a list of human-readable error strings (empty if consistent).
+    Only checks ``from <module> import <name>`` statements in test files
+    against top-level definitions in non-test ``.py`` files.
+    """
+    defined, _ = _build_module_definitions(code_drafts)
 
     # Scan test files for `from X import Y` and cross-check
     errors: list[str] = []
@@ -701,6 +918,162 @@ def _check_import_consistency(code_drafts: dict[str, str]) -> list[str]:
     return errors
 
 
+# ------------------------------------------------------------------
+# Cross-module contract checking
+# ------------------------------------------------------------------
+
+def _count_return_elements(func_node: ast.FunctionDef) -> int | None:
+    """Determine the tuple length of a function's return value.
+
+    Returns:
+    - ``1`` if every ``return`` yields a single (non-tuple) value
+    - ``N`` if every ``return`` yields a tuple of *N* elements
+    - ``None`` if there are no returns, mixed lengths, or bare returns
+    """
+    counts: set[int] = set()
+    for node in ast.walk(func_node):
+        if isinstance(node, ast.Return) and node.value is not None:
+            if isinstance(node.value, ast.Tuple):
+                counts.add(len(node.value.elts))
+            else:
+                counts.add(1)
+    if len(counts) == 1:
+        return counts.pop()
+    return None
+
+
+def _min_positional_args(func_node: ast.FunctionDef) -> int:
+    """Return the minimum number of positional arguments (excluding *self*)."""
+    args = func_node.args
+    n_total = len(args.args)
+    # Subtract `self` / `cls` for methods (heuristic: first arg named self/cls)
+    if n_total and args.args[0].arg in ("self", "cls"):
+        n_total -= 1
+    n_defaults = len(args.defaults)
+    return n_total - n_defaults
+
+
+def _max_positional_args(func_node: ast.FunctionDef) -> int | None:
+    """Return the max positional arguments, or ``None`` if ``*args`` is present."""
+    args = func_node.args
+    if args.vararg:
+        return None
+    n_total = len(args.args)
+    if n_total and args.args[0].arg in ("self", "cls"):
+        n_total -= 1
+    return n_total
+
+
+def _check_cross_module_contracts(code_drafts: dict[str, str]) -> list[str]:
+    """Detect mismatches between function call sites and definitions across modules.
+
+    Catches two classes of bugs:
+    1. **Return-value unpacking mismatch** — e.g. ``a, b = func()`` when
+       ``func`` returns a single value (or vice-versa).
+    2. **Argument count mismatch** — too many or too few positional args
+       at a call site compared to the function definition.
+
+    Only checks calls to functions *imported* from other source modules in
+    the project (not stdlib / third-party).
+    """
+    defined, func_defs = _build_module_definitions(code_drafts)
+    errors: list[str] = []
+
+    for fpath, source in code_drafts.items():
+        if not fpath.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+
+        # Map imported names → (module, original_name)
+        imported: dict[str, tuple[str, str]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module in func_defs:
+                for alias in node.names:
+                    local = alias.asname or alias.name
+                    imported[local] = (node.module, alias.name)
+
+        if not imported:
+            continue
+
+        # Walk the AST looking for calls to imported functions
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            # Simple call: func_name(...)
+            if isinstance(node.func, ast.Name) and node.func.id in imported:
+                mod, orig_name = imported[node.func.id]
+                fdef = func_defs[mod].get(orig_name)
+                if fdef is None:
+                    continue
+
+                # --- Argument count check ---
+                n_pos = len(node.args)
+                has_starargs = any(
+                    isinstance(a, ast.Starred) for a in node.args
+                )
+                if not has_starargs:
+                    min_args = _min_positional_args(fdef)
+                    max_args = _max_positional_args(fdef)
+                    if n_pos < min_args:
+                        errors.append(
+                            f"Contract mismatch in {fpath}: "
+                            f"call to '{orig_name}()' passes {n_pos} "
+                            f"positional arg(s) but it requires at least "
+                            f"{min_args}"
+                        )
+                    elif max_args is not None and n_pos > max_args:
+                        errors.append(
+                            f"Contract mismatch in {fpath}: "
+                            f"call to '{orig_name}()' passes {n_pos} "
+                            f"positional arg(s) but it accepts at most "
+                            f"{max_args}"
+                        )
+
+                # --- Return-value unpacking check ---
+                # Walk parent assignments to find unpacking
+                _check_return_unpacking(
+                    tree, node, fdef, orig_name, fpath, errors
+                )
+
+    return errors
+
+
+def _check_return_unpacking(
+    tree: ast.Module,
+    call_node: ast.Call,
+    func_def: ast.FunctionDef,
+    func_name: str,
+    fpath: str,
+    errors: list[str],
+) -> None:
+    """Check if a call's return-value unpacking matches the function definition."""
+    ret_count = _count_return_elements(func_def)
+    if ret_count is None:
+        return  # Can't determine return shape — skip
+
+    # Find Assign/AnnAssign nodes that contain this exact call
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and node.value is call_node:
+            target = node.targets[0] if len(node.targets) == 1 else None
+            if isinstance(target, ast.Tuple):
+                unpack_count = len(target.elts)
+                if unpack_count != ret_count:
+                    errors.append(
+                        f"Contract mismatch in {fpath}: "
+                        f"'{func_name}()' returns {ret_count} value(s) "
+                        f"but call site unpacks into {unpack_count}"
+                    )
+            elif target is not None and ret_count > 1:
+                errors.append(
+                    f"Contract mismatch in {fpath}: "
+                    f"'{func_name}()' returns a tuple of {ret_count} "
+                    f"values but call site assigns to a single variable"
+                )
+
+
 def _check_syntax(code_drafts: dict[str, str]) -> list[str]:
     """Check every ``.py`` draft for syntax errors using ``ast.parse``.
 
@@ -718,6 +1091,85 @@ def _check_syntax(code_drafts: dict[str, str]) -> list[str]:
             lineno = exc.lineno or "?"
             msg = exc.msg or "unknown syntax error"
             errors.append(f"SyntaxError in {fpath} line {lineno}: {msg}")
+    return errors
+
+
+def _check_pyproject_toml(code_drafts: dict[str, str]) -> list[str]:
+    """Validate ``pyproject.toml`` has the minimum fields for ``pip install -e .``.
+
+    Checks:
+    1. ``[build-system]`` table exists with ``requires`` and ``build-backend``.
+    2. ``[project]`` table exists with ``name``.
+    3. No mixed build-backend configuration (e.g. setuptools + hatchling).
+    """
+    source = code_drafts.get("pyproject.toml")
+    if source is None:
+        return []
+
+    errors: list[str] = []
+
+    try:
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:
+            try:
+                import tomllib  # type: ignore[import-not-found]
+            except ModuleNotFoundError:
+                import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+        data = tomllib.loads(source)
+    except Exception as exc:
+        return [f"pyproject.toml: invalid TOML syntax — {exc}"]
+
+    # Check [build-system]
+    build_system = data.get("build-system")
+    if build_system is None:
+        errors.append(
+            "pyproject.toml: missing [build-system] table. "
+            "Add: [build-system]\\nrequires = [\"hatchling\"]\\n"
+            "build-backend = \"hatchling.build\""
+        )
+    else:
+        if "requires" not in build_system:
+            errors.append(
+                "pyproject.toml: [build-system] missing 'requires'. "
+                "Add: requires = [\"hatchling\"]"
+            )
+        if "build-backend" not in build_system:
+            errors.append(
+                "pyproject.toml: [build-system] missing 'build-backend'. "
+                "Add: build-backend = \"hatchling.build\""
+            )
+
+    # Check [project]
+    project = data.get("project")
+    if project is None:
+        errors.append(
+            "pyproject.toml: missing [project] table with 'name'."
+        )
+    elif "name" not in project:
+        errors.append(
+            "pyproject.toml: [project] missing 'name' field."
+        )
+
+    # Detect mixed build backends
+    backend = ""
+    if build_system:
+        backend = str(build_system.get("build-backend", ""))
+    has_setuptools_config = "tool" in data and "setuptools" in data["tool"]
+    has_hatch_config = "tool" in data and "hatch" in data["tool"]
+    if has_setuptools_config and "hatch" in backend:
+        errors.append(
+            "pyproject.toml: mixed backends — [tool.setuptools] config "
+            "found but build-backend is hatchling. Remove [tool.setuptools] "
+            "sections or switch build-backend to setuptools."
+        )
+    if has_hatch_config and "setuptools" in backend:
+        errors.append(
+            "pyproject.toml: mixed backends — [tool.hatch] config "
+            "found but build-backend is setuptools. Remove [tool.hatch] "
+            "sections or switch build-backend to hatchling."
+        )
+
     return errors
 
 
@@ -767,6 +1219,58 @@ def _check_duplicate_modules(code_drafts: dict[str, str]) -> list[str]:
     ]
 
 
+def _resolve_duplicate_layouts(
+    merged_drafts: dict[str, str],
+    new_drafts: dict[str, str],
+) -> None:
+    """Auto-prune one side of a flat-vs-src layout conflict in place.
+
+    When *merged_drafts* contains the same package under both ``pkg/`` (flat)
+    and ``src/pkg/`` (src layout), determine which layout the *new_drafts*
+    predominantly use and remove conflicting files from the other layout.
+
+    Mutates *merged_drafts* in place; returns nothing.
+    """
+    flat_pkgs: set[str] = set()
+    src_pkgs: set[str] = set()
+    for fpath in merged_drafts:
+        parts = fpath.split("/")
+        if len(parts) >= 2 and parts[0] == "src":
+            src_pkgs.add(parts[1])
+        elif len(parts) >= 2 and parts[0] != "tests":
+            flat_pkgs.add(parts[0])
+
+    dupes = flat_pkgs & src_pkgs
+    if not dupes:
+        return
+
+    # Determine preferred layout from new_drafts: count how many new files
+    # use src/ vs flat for each conflicting package.
+    for pkg in dupes:
+        src_count = sum(
+            1 for fp in new_drafts
+            if fp.split("/")[0] == "src"
+            and len(fp.split("/")) >= 2
+            and fp.split("/")[1] == pkg
+        )
+        flat_count = sum(
+            1 for fp in new_drafts
+            if fp.split("/")[0] == pkg
+        )
+        # If the coder is emitting src/ files, keep src layout; otherwise
+        # keep flat.  On ties or no new files, prefer src/ (modern convention).
+        keep_src = src_count >= flat_count
+        prefix_to_remove = f"{pkg}/" if keep_src else f"src/{pkg}/"
+        removed = [fp for fp in merged_drafts if fp.startswith(prefix_to_remove)]
+        for fp in removed:
+            logger.warning(
+                "Auto-pruning duplicate layout file: %s (keeping %s layout)",
+                fp,
+                "src/" if keep_src else "flat",
+            )
+            del merged_drafts[fp]
+
+
 def verifier(state: ScientificState) -> dict[str, Any]:
     """Run ``pytest`` against the generated code.
 
@@ -781,14 +1285,38 @@ def verifier(state: ScientificState) -> dict[str, Any]:
         return {
             "test_logs": ["No code drafts to verify."],
             "iteration_count": state.get("iteration_count", 0) + 1,
+            "_phase_iteration_count": state.get("_phase_iteration_count", 0) + 1,
         }
 
     # Quick structural and import checks before running pytest
-    pre_errors = _check_syntax(code_drafts)
+    syntax_errors = _check_syntax(code_drafts)
+    pre_errors = _check_pyproject_toml(code_drafts)
+    pre_errors += syntax_errors
     if not pre_errors:
         pre_errors = _check_duplicate_modules(code_drafts)
     if not pre_errors:
         pre_errors = _check_import_consistency(code_drafts)
+    if not pre_errors:
+        pre_errors = _check_cross_module_contracts(code_drafts)
+
+    # Track which files are clean (no syntax or import errors)
+    files_with_errors: set[str] = set()
+    for err in syntax_errors:
+        # Extract filename from "SyntaxError in <path> line ..."
+        parts = err.split(" line ")
+        if parts:
+            fpath = parts[0].replace("SyntaxError in ", "").strip()
+            files_with_errors.add(fpath)
+    for err in pre_errors:
+        # Extract filenames from import/duplicate error messages
+        for fpath in code_drafts:
+            if fpath in err:
+                files_with_errors.add(fpath)
+
+    clean_files = sorted(
+        fpath for fpath in code_drafts
+        if fpath.endswith(".py") and fpath not in files_with_errors
+    )
 
     output_dir = state.get("output_dir", "")
 
@@ -816,10 +1344,60 @@ def verifier(state: ScientificState) -> dict[str, Any]:
     else:
         error_repeat_count = 1 if logs else 0
 
-    # Total failure count for this phase (unlike _error_repeat_count which
-    # only tracks consecutive *identical* errors).  Used by the coder to
-    # decide when to lock test files.
+    # Total failure count for this phase
     phase_error_count = state.get("_phase_error_count", 0) + (1 if logs else 0)
+    phase_iter_count = state.get("_phase_iteration_count", 0) + 1
+
+    # Count errors for best-iteration tracking
+    current_error_count = len(logs)
+
+    # Build verified_fixes: if a previous reflector suggestion fixed an
+    # error category, record it as a permanent constraint.
+    verified_fixes = list(state.get("verified_fixes") or [])
+    prev_syntax_errors = state.get("_prev_syntax_file_count", 0)
+    current_syntax_errors = len(files_with_errors)
+    if prev_syntax_errors > 0 and current_syntax_errors < prev_syntax_errors:
+        # Syntax errors decreased — the reflector's advice worked.
+        # Extract the fix pattern from the reflection.
+        reflection = state.get("reflection", "")
+        if reflection and "raw" in reflection.lower() and "docstring" in reflection.lower():
+            fix = "Use raw docstrings (r\"\"\"...\"\"\") for any string containing backslashes"
+            if fix not in verified_fixes:
+                verified_fixes.append(fix)
+        if reflection and "signature" in reflection.lower():
+            fix = "Function signatures MUST match what tests expect — check test imports before defining functions"
+            if fix not in verified_fixes:
+                verified_fixes.append(fix)
+
+    # Track best code drafts for this phase (fewest errors)
+    best_drafts = state.get("best_code_drafts") or {}
+    best_count = state.get("best_error_count", -1)
+    if best_count < 0 or current_error_count < best_count:
+        best_drafts = dict(code_drafts)
+        best_count = current_error_count
+
+    # Rollback: if error count has increased for 3+ consecutive iterations,
+    # revert to the best-known code.
+    if (
+        current_error_count > best_count > 0
+        and error_repeat_count == 0  # different error each time (oscillating)
+        and phase_error_count >= 4
+        and phase_error_count % 3 == 0  # every 3 worsening iterations
+    ):
+        logger.warning(
+            "Reverting to best code snapshot (%d errors vs current %d)",
+            best_count, current_error_count,
+        )
+        code_drafts = dict(best_drafts)
+        if output_dir:
+            _write_code_drafts(code_drafts, output_dir)
+
+    # Detect collection errors (no tests actually ran)
+    log_text = "\n".join(logs) if logs else ""
+    collection_error = bool(logs) and (
+        "collected 0 items" in log_text
+        or "Interrupted: " in log_text and "error during collection" in log_text
+    )
 
     return {
         "test_logs": logs,
@@ -827,6 +1405,14 @@ def verifier(state: ScientificState) -> dict[str, Any]:
         "_prev_error_fingerprint": error_fingerprint,
         "_error_repeat_count": error_repeat_count,
         "_phase_error_count": phase_error_count,
+        "_phase_iteration_count": phase_iter_count,
+        "_prev_syntax_file_count": current_syntax_errors,
+        "_collection_error": collection_error,
+        "clean_files": clean_files,
+        "verified_fixes": verified_fixes,
+        "best_code_drafts": best_drafts,
+        "best_error_count": best_count,
+        "code_drafts": code_drafts,
     }
 
 
@@ -842,8 +1428,24 @@ def reflector(state: ScientificState) -> dict[str, Any]:
     findings_prompt = _load_prompt("EXPLORER_PROMPT_FINDINGS", "findings.md")
 
     log_text = "\n---\n".join(state.get("test_logs", []))
-    reflector_user_msg = f"## Test logs\n```\n{log_text}\n```"
-    response = llm.invoke([
+
+    # Include failing source code so the reflector can see what went wrong
+    code_drafts: dict[str, str] = state.get("code_drafts", {})
+    clean_files: list[str] = state.get("clean_files") or []
+    failing_sources: list[str] = []
+    for fpath, source in sorted(code_drafts.items()):
+        if fpath.endswith(".py") and fpath not in clean_files:
+            failing_sources.append(f"### {fpath}\n```python\n{source}\n```")
+
+    source_section = ""
+    if failing_sources:
+        source_section = (
+            "\n\n## Source code of files with errors\n"
+            + "\n\n".join(failing_sources)
+        )
+
+    reflector_user_msg = f"## Test logs\n```\n{log_text}\n```{source_section}"
+    response = _invoke_llm(llm, [
         SystemMessage(content=reflector_prompt),
         HumanMessage(content=reflector_user_msg),
     ])
@@ -852,7 +1454,7 @@ def reflector(state: ScientificState) -> dict[str, Any]:
     # Extract key findings
     existing = list(state.get("ground_truth", []))
     existing_text = "\n".join(existing) if existing else "(none yet)"
-    findings_response = llm.invoke([
+    findings_response = _invoke_llm(llm, [
         SystemMessage(content=findings_prompt),
         HumanMessage(
             content=(

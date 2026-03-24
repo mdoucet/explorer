@@ -10,6 +10,7 @@ Usage
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import uuid
@@ -27,11 +28,14 @@ from langgraph.graph import END, StateGraph
 from orchestrator.nodes import advance_phase, coder, configure_llm, get_llm, planner, reflector, verifier
 from orchestrator.state import ScientificState, make_checkpointer
 
+logger = logging.getLogger(__name__)
+
 # Load .env file (if present) so env vars are available as CLI defaults
 load_dotenv()
 
 MAX_ITERATIONS = int(os.environ.get("EXPLORER_MAX_ITERATIONS", "20"))  # 0 = unlimited
 REPLAN_THRESHOLD = 3  # N total phase failures → re-engage planner
+MAX_PHASE_ITERATIONS = 8  # max iterations per single phase before force-advancing
 
 
 # ---------------------------------------------------------------------------
@@ -41,9 +45,10 @@ REPLAN_THRESHOLD = 3  # N total phase failures → re-engage planner
 def _make_should_continue(max_iters: int):
     """Return a conditional edge function with a configurable iteration cap.
 
-    Three outcomes:
+    Four outcomes:
     - ``"end"``           — tests passed and all phases are done
     - ``"advance_phase"`` — tests passed but more phases remain
+    - ``"advance_phase"`` — per-phase iteration cap exceeded (force-advance)
     - ``"reflect"``       — tests failed and we haven't hit the cap
     """
     def _should_continue(state: ScientificState) -> str:
@@ -56,6 +61,24 @@ def _make_should_continue(max_iters: int):
             return "end"
         if max_iters > 0 and state.get("iteration_count", 0) >= max_iters:
             return "end"
+        # Per-phase iteration cap: force-advance if stuck too long on one phase.
+        # BUT: never force-advance on collection errors (no tests ran at all),
+        # since that propagates completely broken code to the next phase.
+        phase_iters = state.get("_phase_iteration_count", 0)
+        phases = state.get("plan_phases") or []
+        current = state.get("current_phase", 0)
+        is_collection_error = state.get("_collection_error", False)
+        if (
+            phase_iters >= MAX_PHASE_ITERATIONS
+            and phases
+            and current + 1 < len(phases)
+            and not is_collection_error
+        ):
+            logger.warning(
+                "Phase %d exceeded %d iterations — force-advancing to next phase",
+                current, MAX_PHASE_ITERATIONS,
+            )
+            return "advance_phase"
         return "reflect"
     return _should_continue
 
@@ -67,20 +90,21 @@ def _after_reflector(state: ScientificState) -> str:
     """Route after the reflector: re-plan on persistent failures.
 
     If the total number of failures in the current phase reaches
-    ``REPLAN_THRESHOLD``, the coder is clearly stuck — send the problem back
+    the replan threshold, the coder is clearly stuck — send the problem back
     to the planner so it can decompose the current phase differently or
     suggest a new algorithm.
 
-    We use ``_phase_error_count`` (total failures, regardless of whether
-    they are identical) rather than ``_error_repeat_count`` because the
-    coder often oscillates between *different* bugs each iteration,
-    keeping ``_error_repeat_count`` at 1 forever.
+    The replan threshold uses exponential backoff: 3 errors for the first
+    replan, 6 for the second, etc.  This gives the coder more attempts
+    to self-recover after each replan before triggering another one.
 
     Replanning is capped at ``MAX_REPLANS`` per phase to avoid infinite loops.
     """
     phase_errors = state.get("_phase_error_count", 0)
     replan_count = state.get("_replan_count", 0)
-    if phase_errors >= REPLAN_THRESHOLD and replan_count < MAX_REPLANS:
+    # Exponential backoff: threshold doubles after each replan
+    current_threshold = REPLAN_THRESHOLD * (2 ** replan_count)
+    if phase_errors >= current_threshold and replan_count < MAX_REPLANS:
         return "replan"
     return "coder"
 

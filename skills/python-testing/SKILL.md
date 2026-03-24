@@ -51,19 +51,29 @@ you risk incorrect path setup.
 
 ## pyproject.toml
 
-Always generate a minimal `pyproject.toml` so the project is installable:
+Always generate `pyproject.toml` with ALL THREE required sections.
+Without `[build-system]`, `pip install -e .` fails and tests cannot run.
+
+**Mandatory template** (replace `my-package` and dependencies):
 
 ```toml
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "my-package"
 version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = ["numpy", "scipy"]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.backends"
 ```
+
+**Rules:**
+- `[build-system]` MUST come first with `requires` and `build-backend`.
+- `build-backend` is `"hatchling.build"` (not `"hatchling.backends"`).
+- `[project]` MUST have `name`.
+- Do NOT mix backends: no `[tool.setuptools]` with hatchling, and vice versa.
+- The verifier validates this automatically — missing fields block pytest.
 
 For flat layout, **no extra config** is needed — Hatch auto-discovers
 package directories at the root.
@@ -92,6 +102,29 @@ packages = ["src/my_package"]
   the sandbox is isolated.
 - Pin tolerances for numerical tests: `np.testing.assert_allclose(result, expected, rtol=1e-6)`.
 
+## CLI testing with Click
+
+Click lowercases long option names: `--V0` becomes parameter `v0`, not `V0`.
+Always use lowercase option names to avoid confusion:
+- `@click.option('--v0', type=float)` → parameter is `v0` ✅
+- `@click.option('--V0', type=float)` → parameter is `v0` (not `V0`) ⚠️
+
+To test a CLI that uses relative imports, invoke it as a **module**:
+```python
+cmd = [sys.executable, "-m", "square_well.cli"] + args
+result = subprocess.run(cmd, capture_output=True, text=True)
+```
+
+Do NOT run CLI scripts directly — `python square_well/cli.py` breaks
+relative imports (`from .solver import ...`).
+
+## Cross-module interface consistency
+
+When writing multiple modules that call each other:
+- If `module_a.func()` returns `(x, y)`, every caller must unpack both.
+- If you change a function signature, update ALL importers.
+- The verifier checks this automatically — mismatches block pytest.
+
 ## Common pitfalls
 
 | Pitfall | Fix |
@@ -101,3 +134,6 @@ packages = ["src/my_package"]
 | Missing `__init__.py` | Always generate `__init__.py` for every package dir |
 | `conftest.py` conflicts | Do not generate conftest — let the verifier handle it |
 | Tests rely on host-installed packages | Only depend on stdlib + numpy + scipy |
+| Click `--V0` becomes `v0` | Use lowercase option names or explicit param name |
+| `ImportError: relative import` | Test CLI with `python -m pkg.cli`, not `python pkg/cli.py` |
+| Return value mismatch across modules | Update all callers when changing return type |
