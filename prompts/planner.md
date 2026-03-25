@@ -30,7 +30,11 @@ Rules for phasing:
   - `pyproject.toml` with `[build-system]` (hatchling), `[project]` name and dependencies
   - Package layout with `__init__.py` files
   - All source modules as **stubs** — function signatures with `pass` bodies
-  - Test files with trivial assertions (`assert True`) that verify imports work
+  - Test files with **structural assertions only** — verify imports work,
+    return types are correct, and basic constraints hold (e.g. `assert callable(f)`,
+    `isinstance(result, list)`).  Do NOT include specific numerical expected
+    values (e.g. `assert len(result) == 5`) — stubs have `pass` bodies so
+    the correct numbers are unknown at this stage.
   Phase 1's only goal is a passing `pytest` run that proves the project
   structure, dependencies, and import graph are correct.
 - **Phase 2 onward** implements real logic, one feature per phase.

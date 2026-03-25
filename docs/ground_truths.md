@@ -447,3 +447,35 @@ Four fixes re-applied on top of `7a8565d` ("update for larger LLMs"), addressing
 - **Test count:** 2 new tests (`test_includes_ground_truth`, `test_includes_prior_reflection`).
 
 ### Combined: 11 new tests. Total: 180 tests passing (1 skipped).
+
+## Scaffolding Phase Generates Wrong Test Expectations (July 2025)
+
+### Problem: Hardcoded Numerical Values in Scaffold Tests Lock In Wrong Specifications
+- **Run:** `~/git/schrodinger-qwen`, `gpt-oss:120b` (nemotron-3-super:120b via Ollama), 126 steps, 40 iterations, `passed: false`.
+- **Outcome:** 4 phases (Scaffolding, Solver, Wavefunctions, CLI). Phases 1–3 completed (2–3 force-advanced), Phase 4 stuck for 20+ iterations with identical 6-failed/4-passed pattern.
+- **Root cause:** Phase 1 (scaffolding) generated tests with hardcoded numerical expectations that were **physically wrong**:
+  1. `assert len(energies) == 5` — correct answer is 7 (verified analytically: $C = \sqrt{2 \times 50 \times 1} = 10$, giving 4 even + 3 odd = 7 bound states)
+  2. `assert np.all(np.diff(energies) <= 0)` — requires non-increasing, but comment says "sorted ascending"; solver correctly returns ascending
+  3. `assert len(energies) == 0` for shallow well ($V_0=0.1$) — in 1D, there is ALWAYS at least 1 bound state
+- **Propagation chain:** Scaffolding tests with wrong numbers → test protection locks them in → force-advance propagates broken tests to later phases → solver code is correct but tests reject it → 20+ identical failures → MAX_ITERATIONS hit
+- **Evidence:** The solver's `energies.sort()` returns 7 bound states in ascending order (physically correct). The reflector correctly diagnosed the issue every iteration but the coder couldn't change tests (anti-test-change rule).
+
+### Fix 1: Scaffold Test Quality Guidance (Root Cause Fix)
+- **Files:** `prompts/coder.md`, `prompts/planner.md`
+- **Change (coder.md):** Added explicit rule for scaffolding-phase tests: "MUST use only structural assertions — verify imports, types, shapes, and constraints (e.g. `assert callable(solve)`, `isinstance(result, np.ndarray)`, `len(result) > 0`, `all(x < 0 for x in energies)`). NEVER hardcode specific numerical results."
+- **Change (planner.md):** Replaced "trivial assertions (`assert True`)" with "structural assertions only — verify imports work, return types are correct, and basic constraints hold. Do NOT include specific numerical expected values."
+- **Rationale:** Stubs have `pass` bodies so correct numerical answers are unknown at scaffolding time. Wrong hardcoded values become locked-in specifications that block all later phases.
+
+### Fix 2: Prefer Replan Over Force-Advance (Structural Fix)
+- **File:** `src/cli.py`
+- **Change (`_make_should_continue`):** When per-phase iteration cap (8) is exceeded, now checks `_replan_count < MAX_REPLANS` first. If replans remain, routes to `"reflect"` (which forces a replan via `_after_reflector`). Only force-advances as last resort when replans are also exhausted.
+- **Change (`_after_reflector`):** When `_phase_iteration_count >= MAX_PHASE_ITERATIONS` and replans remain, forces immediate replan (bypasses normal error-count threshold). This gives the planner a chance to decompose the problem differently before carrying failures to the next phase.
+- **Rationale:** The old behavior force-advanced blindly after 8 iterations, carrying wrong tests and broken code forward. The new behavior tries replanning first (giving the planner a shot at a different decomposition) and only force-advances when replanning is exhausted.
+
+### Fix 3: Try/Except Around Graph Runner (Resilience Fix)
+- **File:** `src/cli.py`
+- **Change:** Wrapped `app.stream()` loop in try/except. On unhandled exception: logs the traceback, writes partial summary and ground truth, exits with code 2.
+- **Rationale:** A prior run died silently at step 06 with no error output or summary. The graph runner had no error handling — any exception in LLM invocation, node logic, or streaming killed the process with no diagnostic output.
+
+### Test Impact
+- 8 new tests: `TestShouldContinue` (6 tests), `TestAfterReflector` force-replan (2 tests). Total: 188 tests passing (1 skipped).

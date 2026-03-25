@@ -1958,6 +1958,90 @@ class TestPlannerReplan:
 
 
 # ---------------------------------------------------------------------------
+# Should-continue routing (verifier → next node)
+# ---------------------------------------------------------------------------
+
+class TestShouldContinue:
+    """Tests for _make_should_continue: the verifier's conditional edge."""
+
+    def test_tests_passed_last_phase_returns_end(self) -> None:
+        from src.cli import _make_should_continue
+
+        fn = _make_should_continue(20)
+        state = _base_state(
+            test_logs=[],
+            plan_phases=[{"id": 1, "title": "Only phase"}],
+            current_phase=0,
+        )
+        assert fn(state) == "end"
+
+    def test_tests_passed_more_phases_returns_advance(self) -> None:
+        from src.cli import _make_should_continue
+
+        fn = _make_should_continue(20)
+        state = _base_state(
+            test_logs=[],
+            plan_phases=[{"id": 1, "title": "P1"}, {"id": 2, "title": "P2"}],
+            current_phase=0,
+        )
+        assert fn(state) == "advance_phase"
+
+    def test_phase_cap_with_replans_remaining_returns_reflect(self) -> None:
+        """When phase cap exceeded but replans remain, route to reflect
+        (so _after_reflector can trigger a forced replan)."""
+        from src.cli import _make_should_continue, MAX_PHASE_ITERATIONS
+
+        fn = _make_should_continue(40)
+        state = _base_state(
+            test_logs=["FAILED test_a"],
+            plan_phases=[{"id": 1, "title": "P1"}, {"id": 2, "title": "P2"}],
+            current_phase=0,
+            _phase_iteration_count=MAX_PHASE_ITERATIONS,
+            _replan_count=0,
+        )
+        assert fn(state) == "reflect"
+
+    def test_phase_cap_with_replans_exhausted_returns_advance(self) -> None:
+        """When phase cap exceeded AND replans exhausted, force-advance."""
+        from src.cli import _make_should_continue, MAX_PHASE_ITERATIONS, MAX_REPLANS
+
+        fn = _make_should_continue(40)
+        state = _base_state(
+            test_logs=["FAILED test_a"],
+            plan_phases=[{"id": 1, "title": "P1"}, {"id": 2, "title": "P2"}],
+            current_phase=0,
+            _phase_iteration_count=MAX_PHASE_ITERATIONS,
+            _replan_count=MAX_REPLANS,
+        )
+        assert fn(state) == "advance_phase"
+
+    def test_phase_cap_collection_error_returns_reflect(self) -> None:
+        """Collection errors never force-advance — always reflect."""
+        from src.cli import _make_should_continue, MAX_PHASE_ITERATIONS, MAX_REPLANS
+
+        fn = _make_should_continue(40)
+        state = _base_state(
+            test_logs=["ERRORS: collection failed"],
+            plan_phases=[{"id": 1, "title": "P1"}, {"id": 2, "title": "P2"}],
+            current_phase=0,
+            _phase_iteration_count=MAX_PHASE_ITERATIONS,
+            _replan_count=MAX_REPLANS,
+            _collection_error=True,
+        )
+        assert fn(state) == "reflect"
+
+    def test_max_iterations_returns_end(self) -> None:
+        from src.cli import _make_should_continue
+
+        fn = _make_should_continue(10)
+        state = _base_state(
+            test_logs=["FAILED test_a"],
+            iteration_count=10,
+        )
+        assert fn(state) == "end"
+
+
+# ---------------------------------------------------------------------------
 # After-reflector routing
 # ---------------------------------------------------------------------------
 
@@ -2011,6 +2095,30 @@ class TestAfterReflector:
             _phase_error_count=REPLAN_THRESHOLD,
         )
         assert _after_reflector(state) == "replan"
+
+    def test_force_replan_when_phase_cap_exceeded(self) -> None:
+        """When phase iteration cap is exceeded and replans remain,
+        force a replan regardless of error count threshold."""
+        from src.cli import _after_reflector, MAX_PHASE_ITERATIONS
+
+        state = _base_state(
+            _phase_error_count=1,  # below normal threshold
+            _phase_iteration_count=MAX_PHASE_ITERATIONS,
+            _replan_count=0,
+        )
+        assert _after_reflector(state) == "replan"
+
+    def test_no_force_replan_when_replans_exhausted(self) -> None:
+        """When phase cap exceeded but replans are exhausted, route to coder
+        (force-advance will happen in _should_continue instead)."""
+        from src.cli import _after_reflector, MAX_PHASE_ITERATIONS, MAX_REPLANS
+
+        state = _base_state(
+            _phase_error_count=10,
+            _phase_iteration_count=MAX_PHASE_ITERATIONS,
+            _replan_count=MAX_REPLANS,
+        )
+        assert _after_reflector(state) == "coder"
 
 
 # ---------------------------------------------------------------------------

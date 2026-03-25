@@ -9,10 +9,21 @@ Rules:
 - Each module must have a docstring with the LaTeX formula it implements.
 - Produce ONE logic file and ONE interface / CLI file per module.
 - Include a pytest test file for each module.
+- **Scaffolding-phase tests** (Phase 1, stub-only phase) MUST use only
+  **structural assertions** — verify imports, types, shapes, and
+  constraints (e.g. `assert callable(solve)`, `isinstance(result, np.ndarray)`,
+  `len(result) > 0`, `all(x < 0 for x in energies)`).
+  NEVER hardcode specific numerical results in scaffolding tests (e.g.
+  `assert len(energies) == 5` or `assert energy == -3.14`).  The stubs
+  have `pass` bodies so you cannot know the correct numerical answers yet.
+  Wrong hardcoded values become locked-in specifications that block all
+  later phases.
 - When implementing a phase AFTER a scaffolding phase, your tests MUST
   validate the real behaviour you implemented — not stubs.  Replace any
   placeholder assertions (`assert True`, `assert len(...) == 0`) from the
   scaffolding phase with tests that verify actual computed results.
+  This is when you introduce concrete numerical expectations — derived
+  from the mathematics, not guessed.
 - CRITICAL: Output each file inside a fenced code block whose info-string
   is EXACTLY the relative file path — nothing else.  Do NOT put a language
   tag before the path.  Examples:

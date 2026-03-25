@@ -48,7 +48,8 @@ def _make_should_continue(max_iters: int):
     Four outcomes:
     - ``"end"``           — tests passed and all phases are done
     - ``"advance_phase"`` — tests passed but more phases remain
-    - ``"advance_phase"`` — per-phase iteration cap exceeded (force-advance)
+    - ``"advance_phase"`` — per-phase iteration cap exceeded AND replans
+                            exhausted (force-advance as last resort)
     - ``"reflect"``       — tests failed and we haven't hit the cap
     """
     def _should_continue(state: ScientificState) -> str:
@@ -61,21 +62,34 @@ def _make_should_continue(max_iters: int):
             return "end"
         if max_iters > 0 and state.get("iteration_count", 0) >= max_iters:
             return "end"
-        # Per-phase iteration cap: force-advance if stuck too long on one phase.
-        # BUT: never force-advance on collection errors (no tests ran at all),
-        # since that propagates completely broken code to the next phase.
+        # Per-phase iteration cap: if stuck too long on one phase, prefer
+        # replanning first.  Only force-advance as a last resort (when
+        # replans are also exhausted) to avoid carrying broken tests to
+        # the next phase.
+        # Never force-advance on collection errors (no tests ran at all).
         phase_iters = state.get("_phase_iteration_count", 0)
         phases = state.get("plan_phases") or []
         current = state.get("current_phase", 0)
         is_collection_error = state.get("_collection_error", False)
+        replan_count = state.get("_replan_count", 0)
         if (
             phase_iters >= MAX_PHASE_ITERATIONS
             and phases
             and current + 1 < len(phases)
             and not is_collection_error
         ):
+            if replan_count < MAX_REPLANS:
+                # Still have replans available — let the reflector trigger one
+                logger.warning(
+                    "Phase %d exceeded %d iterations — routing to reflector "
+                    "(replans remaining: %d)",
+                    current, MAX_PHASE_ITERATIONS, MAX_REPLANS - replan_count,
+                )
+                return "reflect"
+            # Replans exhausted — force-advance as last resort
             logger.warning(
-                "Phase %d exceeded %d iterations — force-advancing to next phase",
+                "Phase %d exceeded %d iterations and replans exhausted "
+                "— force-advancing to next phase",
                 current, MAX_PHASE_ITERATIONS,
             )
             return "advance_phase"
@@ -99,13 +113,24 @@ def _after_reflector(state: ScientificState) -> str:
     to self-recover after each replan before triggering another one.
 
     Replanning is capped at ``MAX_REPLANS`` per phase to avoid infinite loops.
+
+    When the per-phase iteration cap is exceeded and replans remain,
+    a replan is forced immediately (bypassing the error-count threshold)
+    to give the planner a chance to decompose the problem differently
+    before the run force-advances.
     """
     phase_errors = state.get("_phase_error_count", 0)
     replan_count = state.get("_replan_count", 0)
-    # Exponential backoff: threshold doubles after each replan
-    current_threshold = REPLAN_THRESHOLD * (2 ** replan_count)
-    if phase_errors >= current_threshold and replan_count < MAX_REPLANS:
-        return "replan"
+    phase_iters = state.get("_phase_iteration_count", 0)
+
+    if replan_count < MAX_REPLANS:
+        # Force replan when phase iteration cap exceeded
+        if phase_iters >= MAX_PHASE_ITERATIONS:
+            return "replan"
+        # Normal exponential-backoff replan trigger
+        current_threshold = REPLAN_THRESHOLD * (2 ** replan_count)
+        if phase_errors >= current_threshold:
+            return "replan"
     return "coder"
 
 
@@ -401,12 +426,20 @@ def run(task: str | None, task_file: str | None, thread_id: str, db: str,
 
     # Stream node-by-node for live reporting
     final_state: dict[str, Any] = dict(input_state)
-    for event in app.stream(input_state, config=config):
-        for node_name, update in event.items():
-            report_node(node_name, update)
-            if chat_logger:
-                chat_logger.log_node(node_name, update)
-            final_state.update(update)
+    try:
+        for event in app.stream(input_state, config=config):
+            for node_name, update in event.items():
+                report_node(node_name, update)
+                if chat_logger:
+                    chat_logger.log_node(node_name, update)
+                final_state.update(update)
+    except Exception:
+        logger.exception("Graph runner crashed — writing partial results")
+        click.echo("💥 Graph runner crashed unexpectedly. See logs above.")
+        if chat_logger:
+            chat_logger.write_summary(final_state)
+        _write_ground_truth(final_state)
+        sys.exit(2)
 
     iters = final_state.get("iteration_count", 0)
     logs = final_state.get("test_logs", [])
