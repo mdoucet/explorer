@@ -21,6 +21,7 @@ from orchestrator.nodes import (
     _normalize_pytest_output,
     _parse_code_blocks,
     _parse_plan_phases,
+    _parse_unfenced_blocks,
     _prepare_sandbox,
     _resolve_duplicate_layouts,
     _warn_stale_files,
@@ -187,6 +188,94 @@ class TestParseCodeBlocks:
         drafts = _parse_code_blocks(text)
         assert list(drafts.keys()) == ["src/solver.py"]
         assert "def solve" in drafts["src/solver.py"]
+
+
+# ---------------------------------------------------------------------------
+# Unfenced code block fallback parser
+# ---------------------------------------------------------------------------
+
+
+class TestParseUnfencedBlocks:
+    def test_bare_filepath_headers(self) -> None:
+        """LLM outputs filenames as standalone lines without ``` markers."""
+        text = (
+            "pyproject.toml\n"
+            "[project]\n"
+            'name = "foo"\n'
+            "\n"
+            "src/foo/__init__.py\n"
+            '"""Top-level package."""\n'
+            "\n"
+            "src/foo/solver.py\n"
+            "def solve():\n"
+            "    pass\n"
+        )
+        drafts = _parse_unfenced_blocks(text)
+        assert set(drafts.keys()) == {
+            "pyproject.toml",
+            "src/foo/__init__.py",
+            "src/foo/solver.py",
+        }
+        assert "[project]" in drafts["pyproject.toml"]
+        assert "def solve" in drafts["src/foo/solver.py"]
+
+    def test_single_header_is_ignored(self) -> None:
+        """A single filepath-like line is not enough to trigger fallback."""
+        text = "pyproject.toml\nsome content\n"
+        assert _parse_unfenced_blocks(text) == {}
+
+    def test_empty_content_skipped(self) -> None:
+        """If a section between two headers is blank, skip it."""
+        text = (
+            "src/a.py\n"
+            "\n"
+            "src/b.py\n"
+            "print('b')\n"
+        )
+        drafts = _parse_unfenced_blocks(text)
+        assert "src/a.py" not in drafts
+        assert "src/b.py" in drafts
+
+    def test_parse_code_blocks_uses_fallback_when_no_fences(self) -> None:
+        """_parse_code_blocks should delegate to unfenced fallback."""
+        text = (
+            "pyproject.toml\n"
+            "[project]\n"
+            'name = "bar"\n'
+            "\n"
+            "src/bar.py\n"
+            "x = 1\n"
+        )
+        drafts = _parse_code_blocks(text)
+        assert "pyproject.toml" in drafts
+        assert "src/bar.py" in drafts
+
+    def test_fenced_blocks_take_priority(self) -> None:
+        """When fenced blocks are present, unfenced fallback is not used."""
+        text = (
+            "```src/a.py\nprint('a')\n```\n"
+            "src/b.py\nprint('b')\n"
+        )
+        drafts = _parse_code_blocks(text)
+        assert "src/a.py" in drafts
+        assert "src/b.py" not in drafts
+
+    def test_lines_with_spaces_not_treated_as_headers(self) -> None:
+        """Lines containing spaces should not be mistaken for file paths."""
+        text = (
+            "src/a.py\n"
+            "def hello():\n"
+            "    print('hello world')\n"
+            "some explanation text here\n"
+            "src/b.py\n"
+            "x = 1\n"
+        )
+        drafts = _parse_unfenced_blocks(text)
+        assert "src/a.py" in drafts
+        assert "src/b.py" in drafts
+        # "some explanation text here" is NOT a filepath header (has spaces),
+        # so it stays inside a.py's content block.
+        assert "some explanation text here" in drafts["src/a.py"]
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +449,96 @@ class TestWriteCodeDrafts:
         target.write_text("old content\n")
         _write_code_drafts({"hello.py": "new content\n"}, str(tmp_path))
         assert target.read_text() == "new content\n"
+
+
+# ---------------------------------------------------------------------------
+# Reflector context enrichment
+# ---------------------------------------------------------------------------
+
+
+class TestReflectorContext:
+    """The reflector should receive direction, ground_truth, and prior reflection."""
+
+    def test_includes_anti_test_change_directive(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Reflector user message must instruct never to suggest test changes."""
+        fake = _FakeLLM("Fix the implementation.")
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(
+            test_logs=["TypeError: unexpected keyword argument 'V0'"],
+            code_drafts={"solver.py": "def solve(depth): pass\n"},
+        )
+        result = reflector(state)
+        prompt = result["_prompt_summary"]
+        assert "NEVER suggest changing test" in prompt
+        assert "fix the implementation" in prompt.lower()
+
+    def test_includes_ground_truth(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake = _FakeLLM("Try a different approach.")
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(
+            test_logs=["FAILED test - assert 0 == 1"],
+            ground_truth=["- brentq needs bracket endpoints with opposite signs"],
+        )
+        result = reflector(state)
+        prompt = result["_prompt_summary"]
+        assert "Known lessons" in prompt
+        assert "brentq needs bracket" in prompt
+
+    def test_includes_prior_reflection(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake = _FakeLLM("Different root cause found.")
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(
+            test_logs=["FAILED test - assert 0 == 1"],
+            reflection="Previous suggestion: use finer grid. Did not work.",
+        )
+        result = reflector(state)
+        prompt = result["_prompt_summary"]
+        assert "Previous reflection" in prompt
+        assert "finer grid" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Coder ground-truth context
+# ---------------------------------------------------------------------------
+
+
+class TestCoderGroundTruthContext:
+    """The coder should see accumulated ground_truth as lessons learned."""
+
+    def test_includes_ground_truth_in_prompt(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake = _FakeLLM("```solver.py\ndef solve(): pass\n```")
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(
+            plan="Implement the solver",
+            ground_truth=["- Use brentq not bisect for root finding"],
+        )
+        result = coder(state)
+        prompt = result["_prompt_summary"]
+        assert "Lessons learned" in prompt
+        assert "brentq not bisect" in prompt
+
+    def test_no_ground_truth_section_when_empty(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake = _FakeLLM("```solver.py\ndef solve(): pass\n```")
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state(plan="Implement the solver")
+        result = coder(state)
+        prompt = result["_prompt_summary"]
+        assert "Lessons learned" not in prompt
 
 
 # ---------------------------------------------------------------------------

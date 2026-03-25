@@ -420,3 +420,30 @@ Three changes were implemented based on the run comparison findings above:
 - Updated `prompts/coder.md`: Replaced "generate a minimal pyproject.toml" with an exact copy-paste template including `[build-system]`, `[project]`, and explicit warnings.
 - Updated `skills/python-testing/SKILL.md`: Replaced vague template with mandatory template, added rules section, fixed `hatchling.backends` → `hatchling.build`.
 - Updated `prompts/planner.md`: Phase 1 scaffolding requirement now explicitly mentions `[build-system]` (hatchling) alongside `[project]`.
+
+## Context Curation Fixes (March 2025)
+
+Four fixes re-applied on top of `7a8565d` ("update for larger LLMs"), addressing issues observed in run #4 (nemotron-3-super:120b, Schrödinger finite-well task).
+
+### 1. Unfenced Code Block Fallback Parser
+- **Problem observed:** Some LLMs (especially nemotron-3-super:120b) occasionally emit file contents without fenced code blocks — just a filepath line followed by code. `_parse_code_blocks()` returned an empty dict, causing "No code drafts" failures.
+- **Fix:** `_parse_code_blocks()` now falls back to `_parse_unfenced_blocks()` when no fenced blocks are found. The fallback detects standalone lines that pass `_looks_like_filepath()` and collects content between consecutive filepath headers. Requires ≥2 filepath headers to activate (single match is too ambiguous).
+- **Test count:** 6 new tests in `TestParseUnfencedBlocks`.
+
+### 2. Reflector Anti-Test-Change Directive
+- **Problem observed:** In runs #3 and #4, the reflector suggested changing test files to match broken code, e.g. "adjust test expectations" or "change the test to accept the actual values." This caused the coder to weaken tests, masking real implementation bugs.
+- **Fix (prompt):** Added to `prompts/reflector.md`: "NEVER suggest changing tests. Tests are the specification — they define the correct API signatures, function names, parameter names, return types, and expected values."
+- **Fix (code):** The reflector node now injects an "IMPORTANT: direction of fixes" section into the user message, reinforcing that tests are the specification and implementation must change to match.
+- **Test count:** 1 new test (`test_includes_anti_test_change_directive`).
+
+### 3. Ground Truth → Coder Context
+- **Problem observed:** In run #4, the coder node only received ground_truth indirectly via the planner's revised plan. The coder kept repeating algorithmic mistakes (e.g. using fixed bracketing intervals) that the reflector had already identified as failures, because the ground_truth findings weren't in the coder's prompt.
+- **Fix:** The `coder()` function now injects `state['ground_truth']` as a "## Lessons learned from prior iterations" section in the user prompt. Empty ground_truth produces no section.
+- **Test count:** 2 new tests in `TestCoderGroundTruthContext`.
+
+### 4. Enriched Reflector Context
+- **Problem observed:** The reflector lacked context to produce targeted advice: it didn't see prior reflections (leading to repetition), didn't see accumulated ground_truth findings (re-discovering the same insights), and lacked explicit direction about never changing tests.
+- **Fix:** The reflector node now builds a `reflector_parts` list with: (a) "IMPORTANT: direction of fixes" block, (b) "Known lessons (do NOT re-suggest these)" from ground_truth, (c) "Previous reflection" from the prior iteration.
+- **Test count:** 2 new tests (`test_includes_ground_truth`, `test_includes_prior_reflection`).
+
+### Combined: 11 new tests. Total: 180 tests passing (1 skipped).

@@ -16,3 +16,7 @@ Rules:
   ```python
   # concrete fix
   ```
+- NEVER suggest changing tests.  Tests are the specification — they define
+  the correct API signatures, function names, parameter names, return types,
+  and expected values.  Always fix the IMPLEMENTATION to match the tests,
+  not the other way around.

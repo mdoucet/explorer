@@ -518,6 +518,14 @@ def coder(state: ScientificState) -> dict[str, Any]:
     if env_info:
         user_parts.append(f"## Environment\n{env_info}")
 
+    # Inject accumulated ground-truth lessons so the coder avoids
+    # repeating mistakes from prior iterations.
+    gt = state.get("ground_truth") or []
+    if gt:
+        user_parts.append(
+            "## Lessons learned from prior iterations\n" + "\n".join(gt)
+        )
+
     # Inject verified fixes as non-negotiable constraints
     verified_fixes = state.get("verified_fixes") or []
     if verified_fixes:
@@ -674,7 +682,11 @@ def _looks_like_filepath(info_string: str) -> bool:
 
 
 def _parse_code_blocks(text: str) -> dict[str, str]:
-    """Extract fenced code blocks whose info-strings look like file paths."""
+    """Extract fenced code blocks whose info-strings look like file paths.
+
+    Falls back to :func:`_parse_unfenced_blocks` when no fenced blocks are
+    found -- some LLMs emit file paths as bare header lines without fence markers.
+    """
     drafts: dict[str, str] = {}
     lines = text.splitlines(keepends=True)
     i = 0
@@ -690,6 +702,42 @@ def _parse_code_blocks(text: str) -> dict[str, str]:
                     i += 1
                 drafts[info] = "".join(code_lines)
         i += 1
+
+    if not drafts:
+        drafts = _parse_unfenced_blocks(text)
+
+    return drafts
+
+
+def _parse_unfenced_blocks(text: str) -> dict[str, str]:
+    """Fallback parser for LLM output that omits fenced code blocks.
+
+    Detects standalone lines that look like file paths and collects everything
+    between consecutive path lines as that file's content.  Only activates
+    when at least two filepath-like headers are found (a single match is too
+    ambiguous to be trustworthy).
+    """
+    lines = text.splitlines(keepends=True)
+    headers: list[tuple[int, str]] = []
+    for idx, raw in enumerate(lines):
+        candidate = raw.strip()
+        if (
+            candidate
+            and " " not in candidate
+            and _looks_like_filepath(candidate)
+        ):
+            headers.append((idx, candidate))
+
+    if len(headers) < 2:
+        return {}
+
+    drafts: dict[str, str] = {}
+    for pos, (line_idx, filepath) in enumerate(headers):
+        start = line_idx + 1
+        end = headers[pos + 1][0] if pos + 1 < len(headers) else len(lines)
+        content = "".join(lines[start:end]).strip("\n")
+        if content:
+            drafts[filepath] = content + "\n"
     return drafts
 
 
@@ -1444,7 +1492,36 @@ def reflector(state: ScientificState) -> dict[str, Any]:
             + "\n\n".join(failing_sources)
         )
 
-    reflector_user_msg = f"## Test logs\n```\n{log_text}\n```{source_section}"
+    reflector_parts: list[str] = []
+    reflector_parts.append(f"## Test logs\n```\n{log_text}\n```")
+    if source_section:
+        reflector_parts.append(source_section)
+
+    reflector_parts.append(
+        "## IMPORTANT: direction of fixes\n"
+        "Tests are the SPECIFICATION.  NEVER suggest changing test files.\n"
+        "Always fix the implementation (source code) to match the tests.\n"
+        "If a test calls `f(V0=50)` but the function uses `depth`, change "
+        "the function parameter name to `V0`, NOT the test."
+    )
+
+    # Include accumulated lessons so the reflector avoids re-suggesting
+    # approaches that already failed.
+    gt = state.get("ground_truth") or []
+    if gt:
+        reflector_parts.append(
+            "## Known lessons (do NOT re-suggest these)\n" + "\n".join(gt)
+        )
+
+    # Include prior reflection so the reflector knows what was already tried.
+    prev_reflection = state.get("reflection", "")
+    if prev_reflection:
+        reflector_parts.append(
+            "## Previous reflection (this approach did NOT work)\n"
+            + prev_reflection
+        )
+
+    reflector_user_msg = "\n\n".join(reflector_parts)
     response = _invoke_llm(llm, [
         SystemMessage(content=reflector_prompt),
         HumanMessage(content=reflector_user_msg),
