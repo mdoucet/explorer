@@ -71,7 +71,7 @@ class TestFullLoopSuccess:
     def test_single_iteration_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The planner is called once, coder once, triage once. No reflector needed.
         fake = _SequenceLLM([_PLAN_RESPONSE, _CODE_RESPONSE, "LGTM"])
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         from src.cli import build_graph
 
@@ -131,7 +131,7 @@ def test_five():
             _CODE_RESPONSE,   # coder #2 (will pass)
             "LGTM",           # triage #2 (falls through to pytest)
         ])
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         from src.cli import build_graph
 
@@ -184,7 +184,7 @@ def test_five():
 ```
 """
         fake = _SequenceLLM([_PLAN_RESPONSE, bad_code, "LGTM"])
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         checkpointer = make_checkpointer(db_path)
         graph = build_graph(max_iterations=1)
@@ -216,7 +216,7 @@ def test_five():
 
         # --- Second run (resume): read full state, delete checkpoint, restart ---
         fake2 = _SequenceLLM([_PLAN_RESPONSE, _CODE_RESPONSE, "LGTM"])
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake2)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake2)
 
         checkpointer2 = make_checkpointer(db_path)
         graph2 = build_graph(max_iterations=0)

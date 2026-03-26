@@ -77,7 +77,7 @@ class _FakeLLM:
 class TestPlanner:
     def test_returns_plan(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = _FakeLLM("## Plan\nCompute $n!$ recursively.")
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state()
         result = planner(state)
@@ -87,7 +87,7 @@ class TestPlanner:
 
     def test_appends_to_transcript(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = _FakeLLM("## Phase 1: Core\nBuild it.\nFiles: core.py\n")
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state()
         result = planner(state)
@@ -98,7 +98,7 @@ class TestPlanner:
 
     def test_includes_reflection_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = _FakeLLM("revised plan")
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(reflection="Off-by-one error in loop")
         result = planner(state)
@@ -119,7 +119,7 @@ class TestCoder:
             "```\n"
         )
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(plan="implement factorial")
         result = coder(state)
@@ -130,7 +130,7 @@ class TestCoder:
     def test_stores_raw_response(self, monkeypatch: pytest.MonkeyPatch) -> None:
         llm_output = "No code blocks here, just text."
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(plan="implement something")
         result = coder(state)
@@ -300,7 +300,7 @@ class TestVerifier:
     def _mock_triage_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """LLM triage returns LGTM so verifier falls through to pytest."""
         monkeypatch.setattr(
-            "orchestrator.nodes.get_llm", lambda: _FakeLLM("LGTM")
+            "orchestrator.nodes._shared.get_llm", lambda: _FakeLLM("LGTM")
         )
 
     def test_passing_code_flat_layout(self) -> None:
@@ -426,7 +426,7 @@ class TestReflector:
             "## Action\n"
             "RETRY"
         )
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(test_logs=["AssertionError: assert -1 == 120"])
         result = reflector(state)
@@ -483,7 +483,7 @@ class TestReflectorContext:
     ) -> None:
         """Reflector user message must instruct never to suggest test changes."""
         fake = _FakeLLM("Fix the implementation.")
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             test_logs=["TypeError: unexpected keyword argument 'V0'"],
@@ -496,7 +496,7 @@ class TestReflectorContext:
 
     def test_includes_ground_truth(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = _FakeLLM("Try a different approach.")
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             test_logs=["FAILED test - assert 0 == 1"],
@@ -518,7 +518,7 @@ class TestReflectorContext:
 
     def test_includes_prior_reflection(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = _FakeLLM("Different root cause found.")
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             test_logs=["FAILED test - assert 0 == 1"],
@@ -548,7 +548,7 @@ class TestCoderGroundTruthContext:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         fake = _FakeLLM("```solver.py\ndef solve(): pass\n```")
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             plan="Implement the solver",
@@ -572,7 +572,7 @@ class TestCoderGroundTruthContext:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         fake = _FakeLLM("```solver.py\ndef solve(): pass\n```")
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(plan="Implement the solver")
         result = coder(state)
@@ -589,7 +589,7 @@ class TestVerifierWriteMode:
     def _mock_triage_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """LLM triage returns LGTM so verifier falls through to pytest."""
         monkeypatch.setattr(
-            "orchestrator.nodes.get_llm", lambda: _FakeLLM("LGTM")
+            "orchestrator.nodes._shared.get_llm", lambda: _FakeLLM("LGTM")
         )
 
     def test_runs_pytest_in_output_dir(self, tmp_path: Path) -> None:
@@ -778,7 +778,7 @@ class TestPlannerPhases:
             "## Phase 2: Tests\nAdd tests.\nFiles: tests/test_solver.py\n"
         )
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state()
         result = planner(state)
@@ -796,7 +796,7 @@ class TestPlannerPhases:
         monkeypatch.chdir(tmp_path)
         plan_output = "## Phase 1: Core\nBuild the core.\nFiles: core.py\n"
         fake = _FakeLLM(plan_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             reflection="ImportError in cli.py",
@@ -833,7 +833,7 @@ class TestCoderPhaseContext:
     def test_coder_includes_phase_info(self, monkeypatch: pytest.MonkeyPatch) -> None:
         llm_output = "```solver.py\nprint('hello')\n```\n"
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         phases = [
             {"id": 1, "title": "Core", "description": "Build core.", "status": "pending", "files": []},
@@ -848,7 +848,7 @@ class TestCoderPhaseContext:
     def test_coder_accumulates_drafts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         llm_output = "```cli.py\nprint('cli')\n```\n"
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         existing = {"solver.py": "print('solver')"}
         state = _base_state(plan="Build CLI.", code_drafts=existing)
@@ -861,7 +861,7 @@ class TestCoderPhaseContext:
     def test_coder_mentions_existing_files(self, monkeypatch: pytest.MonkeyPatch) -> None:
         llm_output = "```cli.py\nprint('cli')\n```\n"
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         existing = {"solver.py": "code"}
         state = _base_state(plan="Build CLI.", code_drafts=existing)
@@ -875,7 +875,7 @@ class TestCoderPhaseContext:
     ) -> None:
         llm_output = "```cli.py\nprint('cli')\n```\n"
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         existing = {
             "solver.py": "def solve_square_well(n: int) -> float:\n    pass\n",
@@ -954,7 +954,7 @@ class TestCoderErrorContext:
     ) -> None:
         llm_output = "```pkg/mod.py\nx = 1\n```\n"
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             plan="implement constants",
@@ -977,7 +977,7 @@ class TestCoderErrorContext:
     ) -> None:
         llm_output = "```pkg/mod.py\nx = 1\n```\n"
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             plan="fix imports",
@@ -999,7 +999,7 @@ class TestCoderErrorContext:
     ) -> None:
         llm_output = "```pkg/mod.py\nx = 1\n```\n"
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(plan="implement something")
         result = coder(state)
@@ -1013,7 +1013,7 @@ class TestCoderErrorContext:
     ) -> None:
         llm_output = "```pkg/mod.py\nx = 1\n```\n"
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             plan="fix imports",
@@ -1050,7 +1050,7 @@ class TestCoderErrorContext:
             "```tests/test_solver.py\nassert False  # rewritten tests\n```\n"
         )
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         original_test = "from solver import solve\ndef test_it(): assert solve() == 42\n"
         state = _base_state(
@@ -1082,7 +1082,7 @@ class TestCoderErrorContext:
             f"```tests/test_cli.py\n{fixed_test}```\n"
         )
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         buggy_test = "import subprocess, sys\ndef run_cli(args):\n    return subprocess.run([sys.executable, 'pkg/cli.py'] + args, capture_output=True, text=True)\ndef test_cli(): assert run_cli(['--help']).returncode == 0\n"
         state = _base_state(
@@ -1111,7 +1111,7 @@ class TestCoderErrorContext:
             f"```tests/test_solver.py\n{rewritten_test}```\n"
         )
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             plan="fix solver",
@@ -1136,7 +1136,7 @@ class TestCoderErrorContext:
             "```tests/test_solver.py\nfrom solver import solve\ndef test_it(): assert solve() == 42\n```\n"
         )
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(plan="implement solver")
         result = coder(state)
@@ -1171,7 +1171,7 @@ class TestStuckLoopDetection:
                 return msg
 
         monkeypatch.setattr(
-            "orchestrator.nodes.get_llm", lambda: _TriageLLM()
+            "orchestrator.nodes._shared.get_llm", lambda: _TriageLLM()
         )
 
     def test_first_failure_sets_count_to_one(self) -> None:
@@ -1374,7 +1374,7 @@ class TestGroundTruthDedup:
             "## Key Findings\n"
             + existing_finding
         )
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             test_logs=["ImportError: cannot import HBAR"],
@@ -1393,7 +1393,7 @@ class TestGroundTruthDedup:
             "## Key Findings\n"
             "- Brand new finding\n- Another finding"
         )
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             test_logs=["Some error"],
@@ -1413,7 +1413,7 @@ class TestGroundTruthDedup:
         fake = _FakeLLM(
             "Analysis.\n\n## Key Findings\nNONE"
         )
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             test_logs=["assert 1 == 0"],
@@ -1653,7 +1653,7 @@ class TestLlmTriageInVerifier:
         """When LLM triage finds issues, pytest should not run."""
         triage_response = "- Import mismatch: tests/test_mod.py imports 'missing' from 'pkg.mod'"
         monkeypatch.setattr(
-            "orchestrator.nodes.get_llm", lambda: _FakeLLM(triage_response)
+            "orchestrator.nodes._shared.get_llm", lambda: _FakeLLM(triage_response)
         )
         state = _base_state(
             code_drafts={
@@ -1674,7 +1674,7 @@ class TestLlmTriageInVerifier:
     ) -> None:
         """When triage says LGTM, pytest runs and tests pass."""
         monkeypatch.setattr(
-            "orchestrator.nodes.get_llm", lambda: _FakeLLM("LGTM")
+            "orchestrator.nodes._shared.get_llm", lambda: _FakeLLM("LGTM")
         )
         state = _base_state(
             code_drafts={
@@ -1696,7 +1696,7 @@ class TestLlmTriageInVerifier:
         # LLM should NOT be called — raise if it is
         def _should_not_call():
             raise AssertionError("LLM should not be called for syntax errors")
-        monkeypatch.setattr("orchestrator.nodes.get_llm", _should_not_call)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", _should_not_call)
 
         state = _base_state(
             code_drafts={
@@ -1714,7 +1714,7 @@ class TestLlmTriageInVerifier:
         """Verifier transcript includes triage error information."""
         triage_response = "- Duplicate layout: pkg exists in both flat and src"
         monkeypatch.setattr(
-            "orchestrator.nodes.get_llm", lambda: _FakeLLM(triage_response)
+            "orchestrator.nodes._shared.get_llm", lambda: _FakeLLM(triage_response)
         )
         state = _base_state(
             code_drafts={
@@ -1786,7 +1786,7 @@ class TestPlannerReplan:
         monkeypatch.chdir(tmp_path)
         revised = "## Phase 1: Solver v2\nUse brentq instead of matrix diag.\nFiles: solver.py\n"
         fake = _FakeLLM(revised)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         phases = [
             {"id": 1, "title": "Solver", "description": "Build matrix solver.", "status": "pending", "files": ["solver.py"]},
@@ -1815,7 +1815,7 @@ class TestPlannerReplan:
     ) -> None:
         monkeypatch.chdir(tmp_path)
         fake = _FakeLLM("## Phase 1: Fix\nNew approach.\nFiles: solver.py\n")
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         phases = [
             {"id": 1, "title": "Solver", "description": "Build solver.", "status": "pending", "files": []},
@@ -1846,7 +1846,7 @@ class TestPlannerReplan:
         the planner should produce a fresh plan."""
         monkeypatch.chdir(tmp_path)
         fake = _FakeLLM("## Phase 1: Core\nBuild core.\nFiles: core.py\n")
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(reflection="Some stale reflection from a previous bug")
         result = planner(state)
@@ -1860,7 +1860,7 @@ class TestPlannerReplan:
         """Replan should work even if there's only one phase."""
         monkeypatch.chdir(tmp_path)
         fake = _FakeLLM("## Phase 1: Revised\nNew approach.\nFiles: solver.py\n")
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         phases = [
             {"id": 1, "title": "Solver", "description": "Build.", "status": "pending", "files": []},
@@ -1881,7 +1881,7 @@ class TestPlannerReplan:
     ) -> None:
         monkeypatch.chdir(tmp_path)
         fake = _FakeLLM("## Phase 1: Try3\nThird try.\nFiles: solver.py\n")
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         phases = [
             {"id": 1, "title": "Solver", "description": "Build.", "status": "pending", "files": []},
@@ -1908,7 +1908,7 @@ class TestPlannerReplan:
             "## Phase 3: Wavefunctions\nCompute psi(x).\n"
         )
         fake = _FakeLLM(multi_phase)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         phases = [
             {"id": 1, "title": "Scaffolding", "description": "Done.", "status": "completed", "files": []},
@@ -1935,7 +1935,7 @@ class TestPlannerReplan:
         monkeypatch.chdir(tmp_path)
         plain_text = "Use scipy.optimize.brentq to find roots of the transcendental equation."
         fake = _FakeLLM(plain_text)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         phases = [
             {"id": 1, "title": "Solver", "description": "Old.", "status": "pending", "files": []},
@@ -2201,7 +2201,7 @@ class TestCoderDeleteMarker:
             "```\n"
         )
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             plan="refactor to src layout",
@@ -2217,7 +2217,7 @@ class TestCoderDeleteMarker:
         """DELETE marker should work even with surrounding whitespace."""
         llm_output = "```old_file.py\n  # DELETE  \n```\n"
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             plan="clean up",
@@ -2245,7 +2245,7 @@ class TestCleanFileProtection:
             "```\n"
         )
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             plan="fix wavefunctions",
@@ -2270,7 +2270,7 @@ class TestCleanFileProtection:
             "```\n"
         )
         fake = _FakeLLM(llm_output)
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
         state = _base_state(
             plan="fix solver",
