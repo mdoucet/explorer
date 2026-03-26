@@ -12,6 +12,7 @@ from orchestrator.nodes import (
     _check_pyproject_toml,
     _check_syntax,
     _ensure_importable,
+    _extract_findings,
     _llm_triage,
     _pick_replan_phase,
     _extract_signatures,
@@ -416,20 +417,12 @@ class TestPrepareSandbox:
 
 class TestReflector:
     def test_returns_reflection_and_findings(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        responses = [
-            "The factorial function always returns -1.",
-            "- The function uses a hardcoded return value instead of recursion",
-        ]
-        idx = {"i": 0}
-
-        class _SeqLLM:
-            def invoke(self, _msgs: Any) -> Any:
-                msg = MagicMock()
-                msg.content = responses[idx["i"] % len(responses)]
-                idx["i"] += 1
-                return msg
-
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: _SeqLLM())
+        fake = _FakeLLM(
+            "The factorial function always returns -1.\n\n"
+            "## Key Findings\n"
+            "- The function uses a hardcoded return value instead of recursion"
+        )
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
 
         state = _base_state(test_logs=["AssertionError: assert -1 == 120"])
         result = reflector(state)
@@ -1295,6 +1288,37 @@ class TestStuckLoopDetection:
 
 
 # ---------------------------------------------------------------------------
+# _extract_findings
+# ---------------------------------------------------------------------------
+
+class TestExtractFindings:
+    """_extract_findings parses analysis + ## Key Findings from reflector output."""
+
+    def test_splits_analysis_and_findings(self) -> None:
+        text = "Root cause is X.\n\n## Key Findings\n- Finding one\n- Finding two"
+        analysis, findings = _extract_findings(text)
+        assert analysis == "Root cause is X."
+        assert findings == ["- Finding one", "- Finding two"]
+
+    def test_no_findings_section(self) -> None:
+        text = "Root cause is X. No key findings header."
+        analysis, findings = _extract_findings(text)
+        assert analysis == text.strip()
+        assert findings == []
+
+    def test_none_findings(self) -> None:
+        text = "Root cause is X.\n\n## Key Findings\nNONE"
+        analysis, findings = _extract_findings(text)
+        assert analysis == "Root cause is X."
+        assert findings == []
+
+    def test_ignores_non_bullet_lines(self) -> None:
+        text = "Analysis.\n\n## Key Findings\nSome preamble\n- Actual finding\nMore text"
+        analysis, findings = _extract_findings(text)
+        assert findings == ["- Actual finding"]
+
+
+# ---------------------------------------------------------------------------
 # Ground truth deduplication
 # ---------------------------------------------------------------------------
 
@@ -1305,21 +1329,13 @@ class TestGroundTruthDedup:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         existing_finding = "- Define constants at module level"
-        responses = [
-            "The constant is missing from the namespace.",
-            # LLM returns the same finding that already exists
-            existing_finding,
-        ]
-        idx = {"i": 0}
-
-        class _SeqLLM:
-            def invoke(self, _msgs: Any) -> Any:
-                msg = MagicMock()
-                msg.content = responses[idx["i"] % len(responses)]
-                idx["i"] += 1
-                return msg
-
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: _SeqLLM())
+        # LLM returns analysis with the same finding that already exists
+        fake = _FakeLLM(
+            "The constant is missing from the namespace.\n\n"
+            "## Key Findings\n"
+            + existing_finding
+        )
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
 
         state = _base_state(
             test_logs=["ImportError: cannot import HBAR"],
@@ -1333,20 +1349,12 @@ class TestGroundTruthDedup:
     def test_new_findings_still_added(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        responses = [
-            "Analysis of the error.",
-            "- Brand new finding\n- Another finding",
-        ]
-        idx = {"i": 0}
-
-        class _SeqLLM:
-            def invoke(self, _msgs: Any) -> Any:
-                msg = MagicMock()
-                msg.content = responses[idx["i"] % len(responses)]
-                idx["i"] += 1
-                return msg
-
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: _SeqLLM())
+        fake = _FakeLLM(
+            "Analysis of the error.\n\n"
+            "## Key Findings\n"
+            "- Brand new finding\n- Another finding"
+        )
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
 
         state = _base_state(
             test_logs=["Some error"],
@@ -1359,36 +1367,22 @@ class TestGroundTruthDedup:
         assert "- Another finding" in result["ground_truth"]
         assert len(result["ground_truth"]) == 3
 
-    def test_existing_findings_passed_to_llm(
+    def test_no_findings_when_none(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The findings LLM call should receive existing findings so it can
-        avoid repeating them."""
-        captured_msgs: list[Any] = []
-        responses = ["Analysis.", "NONE"]
-        idx = {"i": 0}
-
-        class _CaptureLLM:
-            def invoke(self, msgs: Any) -> Any:
-                captured_msgs.append(msgs)
-                msg = MagicMock()
-                msg.content = responses[idx["i"] % len(responses)]
-                idx["i"] += 1
-                return msg
-
-        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: _CaptureLLM())
+        """When the LLM reports NONE in Key Findings, no new findings added."""
+        fake = _FakeLLM(
+            "Analysis.\n\n## Key Findings\nNONE"
+        )
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
 
         state = _base_state(
             test_logs=["assert 1 == 0"],
             ground_truth=["- Solver returns wrong count"],
         )
-        reflector(state)
+        result = reflector(state)
 
-        # Second LLM call is the findings extraction
-        assert len(captured_msgs) == 2
-        findings_user_msg = captured_msgs[1][1].content
-        assert "Existing findings" in findings_user_msg
-        assert "Solver returns wrong count" in findings_user_msg
+        assert result["ground_truth"] == ["- Solver returns wrong count"]
 
 
 # ---------------------------------------------------------------------------

@@ -562,3 +562,16 @@ Four fixes re-applied on top of `7a8565d` ("update for larger LLMs"), addressing
 - New test classes: `TestLlmTriage` (6 tests), `TestLlmTriageInVerifier` (4 tests)
 - Existing verifier tests updated with autouse `_mock_triage_llm` fixture
 - Integration tests updated with "LGTM" triage response in LLM sequences
+
+## Phase 3: Merge Reflector Into Conversation Flow
+
+- **Problem:** The reflector made 2 separate LLM calls per reflection cycle: (1) analysis with `reflector.md` prompt, (2) findings extraction with `findings.md` prompt. The second call was a simple structured task (extract bullet-point findings) that didn't need a dedicated LLM invocation.
+- **Fix:** Merged the two prompts into a single `reflector.md` that instructs the LLM to output analysis **and** a `## Key Findings` section at the end. The new `_extract_findings()` helper parses the combined response locally, splitting analysis from bullet-point findings. Deduplication against existing `ground_truth` is preserved.
+- **Deleted:** `prompts/findings.md` (merged into `reflector.md`).
+- **New helper:** `_extract_findings(text) -> (analysis, findings_list)` in `nodes.py` — splits on `## Key Findings` header, extracts `"- …"` bullet lines, handles `NONE` sentinel.
+- **Reflector now:** 1 LLM call (was 2). Same outputs: `reflection`, `ground_truth`, `transcript`, `_prompt_summary`. No changes to the `reflection` state field contract — it's still used by coder (`is_revision`), planner (`is_replan`), and verifier (`verified_fixes`).
+
+### Impact
+- nodes.py: 1395 → 1416 lines (net +21 from `_extract_findings` helper; -1 LLM call removed)
+- Tests: 195 → 199 (4 new `_extract_findings` tests, 1 replaced `test_existing_findings_passed_to_llm` → `test_no_findings_when_none`)
+- Integration test LLM sequence reduced from 7 to 6 calls (removed separate findings extraction call)

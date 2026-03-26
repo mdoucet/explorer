@@ -20,3 +20,15 @@ Rules:
   the correct API signatures, function names, parameter names, return types,
   and expected values.  Always fix the IMPLEMENTATION to match the tests,
   not the other way around.
+
+## Key Findings
+
+After your analysis, end your response with a `## Key Findings` section
+containing 1-3 bullet points worth remembering for future iterations.
+Each finding should be a single sentence prefixed with "- ".
+If there is nothing noteworthy beyond what is already known, write
+"## Key Findings" followed by "NONE" on the next line.
+
+Do NOT repeat or rephrase findings that already appear in the run history.
+Only add findings that are genuinely NEW — a different root cause,
+a different variable, or a different algorithmic insight.

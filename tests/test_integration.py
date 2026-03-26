@@ -113,17 +113,19 @@ def test_five():
     assert factorial(5) == 120
 ```
 """
-        reflection = "The function returns a hardcoded -1 instead of computing the factorial."
-        findings = "- The coder produced a stub instead of real logic"
+        reflection = (
+            "The function returns a hardcoded -1 instead of computing the factorial.\n\n"
+            "## Key Findings\n"
+            "- The coder produced a stub instead of real logic"
+        )
 
-        # Sequence: plan → bad code → triage → reflection → findings → good code → triage
+        # Sequence: plan → bad code → triage → reflection (with findings) → good code → triage
         # (reflector routes directly to coder, skipping the planner on revision)
         fake = _SequenceLLM([
             _PLAN_RESPONSE,   # planner #1
             bad_code,          # coder #1 (will fail)
             "LGTM",           # triage #1 (falls through to pytest)
-            reflection,        # reflector (reflection)
-            findings,          # reflector (findings extraction)
+            reflection,        # reflector (single call: analysis + findings)
             _CODE_RESPONSE,   # coder #2 (will pass)
             "LGTM",           # triage #2 (falls through to pytest)
         ])
