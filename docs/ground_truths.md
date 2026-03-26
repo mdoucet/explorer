@@ -517,3 +517,48 @@ Four fixes re-applied on top of `7a8565d` ("update for larger LLMs"), addressing
 - 17 new tests in `tests/test_transcript.py` (5 `TestMakeEntry`, 7 `TestFormatHistory`, 5 `TestTranscriptIntegration`)
 - 7 existing tests updated to provide transcript entries instead of direct state field assertions
 - Total: 205 tests passing (1 skipped).
+
+## Phase 2 Refactor: LLM-Powered Output Validation (Heuristic Replacement)
+
+- **Problem observed:** The verifier contained 7 AST-based heuristic check functions (~250 lines of complex code) that were added reactively to catch specific failure modes: import mismatches, cross-module contract errors (arg count, return unpacking), and layout conflicts (flat vs src/). Each heuristic used `ast.parse` + `ast.walk` to analyze code structure. While effective, they were brittle, hard to maintain, and could only catch the specific patterns they were coded for.
+- **Root cause (heuristic overload):** Each new failure mode observed in production runs led to a new hand-coded AST check. The checks grew organically without a unifying framework, resulting in ~250 lines of tightly coupled code that was hard to extend and test.
+
+### Solution: Replace 3 complex AST heuristics with a single LLM triage call
+
+**Kept (cheap, deterministic):**
+- `_check_syntax()` — 18 lines, `ast.parse()` each `.py` file. Catches syntax errors instantly.
+- `_check_pyproject_toml()` — 78 lines, TOML parse + validate. Prevents `pip install -e .` failures.
+
+**Replaced with `_llm_triage()`:**
+- `_check_import_consistency()` (49 lines) — cross-checked test imports vs source definitions
+- `_check_cross_module_contracts()` (76 lines) — arg count + return unpacking across modules
+- `_check_duplicate_modules()` (31 lines) — flat vs src/ layout conflict detection
+- 5 helper functions: `_build_module_definitions`, `_count_return_elements`, `_min_positional_args`, `_max_positional_args`, `_check_return_unpacking` (~90 lines)
+- **Total removed: ~250 lines**
+
+### New: `_llm_triage(code_drafts, llm)` function
+- Loads `prompts/triage.md` system prompt via `_load_prompt()`
+- Builds a code listing of all `.py` files
+- Calls the LLM with `_invoke_llm()` (same streaming/retry as other nodes)
+- Parses response: "LGTM" → empty list, bullet points → error list
+- Returns `list[str]` in the same format as the old heuristics
+
+### New: `prompts/triage.md`
+- Focused prompt for structural code review before pytest
+- Checks: import consistency, function signature mismatches, return-value unpacking, layout conflicts
+- Output format: bullet-point errors or "LGTM"
+- Rules: only check internal code relationships, tests are specification, be precise
+
+### Verifier flow change
+- Before: syntax → TOML → duplicates → imports → contracts → (pytest OR pre_errors)
+- After: syntax → TOML → LLM triage → (pytest OR pre_errors)
+- The verifier now calls `get_llm()` when syntax + TOML checks pass
+- LLM triage result follows the same `logs = pre_errors or _run_pytest(root)` pattern
+- Triage errors short-circuit pytest, just like the old heuristics
+
+### Impact
+- nodes.py: 1624 → 1395 lines (229 lines removed net)
+- Tests: 206 → 195 (21 heuristic tests removed, 10 triage tests added)
+- New test classes: `TestLlmTriage` (6 tests), `TestLlmTriageInVerifier` (4 tests)
+- Existing verifier tests updated with autouse `_mock_triage_llm` fixture
+- Integration tests updated with "LGTM" triage response in LLM sequences

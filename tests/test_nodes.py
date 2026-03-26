@@ -9,12 +9,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from orchestrator.nodes import (
-    _check_cross_module_contracts,
-    _check_duplicate_modules,
-    _check_import_consistency,
     _check_pyproject_toml,
     _check_syntax,
     _ensure_importable,
+    _llm_triage,
     _pick_replan_phase,
     _extract_signatures,
     _looks_like_filepath,
@@ -295,6 +293,13 @@ class TestParseUnfencedBlocks:
 # ---------------------------------------------------------------------------
 
 class TestVerifier:
+    @pytest.fixture(autouse=True)
+    def _mock_triage_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """LLM triage returns LGTM so verifier falls through to pytest."""
+        monkeypatch.setattr(
+            "orchestrator.nodes.get_llm", lambda: _FakeLLM("LGTM")
+        )
+
     def test_passing_code_flat_layout(self) -> None:
         """Flat layout: package at root, tests import from package name."""
         state = _base_state(
@@ -582,6 +587,13 @@ class TestCoderGroundTruthContext:
 # ---------------------------------------------------------------------------
 
 class TestVerifierWriteMode:
+    @pytest.fixture(autouse=True)
+    def _mock_triage_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """LLM triage returns LGTM so verifier falls through to pytest."""
+        monkeypatch.setattr(
+            "orchestrator.nodes.get_llm", lambda: _FakeLLM("LGTM")
+        )
+
     def test_runs_pytest_in_output_dir(self, tmp_path: Path) -> None:
         """Verifier runs pytest in the output directory, not a temp dir."""
         # Pre-write code into the output directory (flat layout)
@@ -912,248 +924,6 @@ class TestExtractSignatures:
         assert _extract_signatures("[project]\nname = 'foo'\n") == []
 
 
-# ---------------------------------------------------------------------------
-# _check_import_consistency
-# ---------------------------------------------------------------------------
-
-class TestCheckImportConsistency:
-    def test_consistent_imports_pass(self) -> None:
-        drafts = {
-            "solver.py": "def solve(n: int) -> float:\n    pass\n",
-            "tests/test_solver.py": (
-                "from solver import solve\n"
-                "def test_it():\n    assert solve(1) == 1.0\n"
-            ),
-        }
-        assert _check_import_consistency(drafts) == []
-
-    def test_mismatched_import_detected(self) -> None:
-        drafts = {
-            "solver.py": "def solve_square_well(n: int) -> float:\n    pass\n",
-            "tests/test_solver.py": (
-                "from solver import solve_eigenvalue\n"
-                "def test_it():\n    assert solve_eigenvalue(1) == 1.0\n"
-            ),
-        }
-        errors = _check_import_consistency(drafts)
-        assert len(errors) == 1
-        assert "solve_eigenvalue" in errors[0]
-        assert "solve_square_well" in errors[0]
-
-    def test_ignores_unknown_modules(self) -> None:
-        """Imports from external packages should not trigger errors."""
-        drafts = {
-            "solver.py": "def solve() -> None:\n    pass\n",
-            "tests/test_solver.py": (
-                "import numpy as np\n"
-                "from solver import solve\n"
-                "def test_it():\n    solve()\n"
-            ),
-        }
-        assert _check_import_consistency(drafts) == []
-
-    def test_handles_src_layout(self) -> None:
-        drafts = {
-            "src/pkg/solver.py": "def solve() -> None:\n    pass\n",
-            "tests/test_solver.py": (
-                "from pkg.solver import solve\n"
-                "def test_it():\n    solve()\n"
-            ),
-        }
-        assert _check_import_consistency(drafts) == []
-
-    def test_class_imports_pass(self) -> None:
-        drafts = {
-            "engine.py": "class Engine:\n    pass\n",
-            "tests/test_engine.py": (
-                "from engine import Engine\n"
-                "def test_it():\n    Engine()\n"
-            ),
-        }
-        assert _check_import_consistency(drafts) == []
-
-    def test_top_level_assignment_counted(self) -> None:
-        drafts = {
-            "constants.py": "PI = 3.14159\n",
-            "tests/test_constants.py": (
-                "from constants import PI\n"
-                "def test_pi():\n    assert PI > 3\n"
-            ),
-        }
-        assert _check_import_consistency(drafts) == []
-
-    def test_annotated_assignment_counted(self) -> None:
-        """Typed assignments like `X: Final[float] = 1.0` must be recognized."""
-        drafts = {
-            "constants.py": (
-                "from typing import Final\n"
-                "HBAR: Final[float] = 1.0545718e-34\n"
-                "PI: Final[float] = 3.14159\n"
-            ),
-            "tests/test_constants.py": (
-                "from constants import HBAR, PI\n"
-                "def test_hbar():\n    assert HBAR > 0\n"
-            ),
-        }
-        assert _check_import_consistency(drafts) == []
-
-    def test_detects_src_prefix_import(self) -> None:
-        """Imports like `from src.pkg.mod import X` should be flagged."""
-        drafts = {
-            "src/square_well/solver.py": "def find_bound_states() -> list:\n    pass\n",
-            "tests/test_solver.py": (
-                "from src.square_well.solver import find_bound_states\n"
-                "def test_it():\n    find_bound_states()\n"
-            ),
-        }
-        errors = _check_import_consistency(drafts)
-        assert len(errors) == 1
-        assert "src" in errors[0]
-        assert "not a package" in errors[0]
-        assert "square_well.solver" in errors[0]
-
-
-# ---------------------------------------------------------------------------
-# Cross-module contract checking
-# ---------------------------------------------------------------------------
-
-
-class TestCheckCrossModuleContracts:
-    """Detect interface mismatches between function definitions and call sites."""
-
-    def test_matching_contracts_pass(self) -> None:
-        drafts = {
-            "pkg/solver.py": (
-                "def find_energies(a: float, v0: float) -> list[float]:\n"
-                "    return [1.0, 2.0]\n"
-            ),
-            "pkg/cli.py": (
-                "from pkg.solver import find_energies\n"
-                "energies = find_energies(1.0, 10.0)\n"
-            ),
-        }
-        assert _check_cross_module_contracts(drafts) == []
-
-    def test_return_unpacking_mismatch_detected(self) -> None:
-        """CLI unpacks (energies, parities) but solver returns only energies."""
-        drafts = {
-            "pkg/solver.py": (
-                "def find_energies(a: float, v0: float) -> list[float]:\n"
-                "    return [1.0, 2.0]\n"
-            ),
-            "pkg/cli.py": (
-                "from pkg.solver import find_energies\n"
-                "energies, parities = find_energies(1.0, 10.0)\n"
-            ),
-        }
-        errors = _check_cross_module_contracts(drafts)
-        assert len(errors) == 1
-        assert "find_energies" in errors[0]
-        assert "1 value" in errors[0]
-        assert "unpacks into 2" in errors[0]
-
-    def test_tuple_return_to_single_var_detected(self) -> None:
-        """Solver returns (energies, parities) but caller assigns to single var."""
-        drafts = {
-            "pkg/solver.py": (
-                "def find_energies(a: float, v0: float):\n"
-                "    return [1.0], ['even']\n"
-            ),
-            "pkg/cli.py": (
-                "from pkg.solver import find_energies\n"
-                "result = find_energies(1.0, 10.0)\n"
-            ),
-        }
-        errors = _check_cross_module_contracts(drafts)
-        assert len(errors) == 1
-        assert "tuple of 2" in errors[0]
-        assert "single variable" in errors[0]
-
-    def test_correct_tuple_unpacking_passes(self) -> None:
-        drafts = {
-            "pkg/solver.py": (
-                "def find_energies(a: float, v0: float):\n"
-                "    return [1.0], ['even']\n"
-            ),
-            "pkg/cli.py": (
-                "from pkg.solver import find_energies\n"
-                "energies, parities = find_energies(1.0, 10.0)\n"
-            ),
-        }
-        assert _check_cross_module_contracts(drafts) == []
-
-    def test_too_few_args_detected(self) -> None:
-        drafts = {
-            "pkg/solver.py": (
-                "def find_energies(a: float, v0: float) -> list:\n"
-                "    return []\n"
-            ),
-            "pkg/cli.py": (
-                "from pkg.solver import find_energies\n"
-                "find_energies(1.0)\n"
-            ),
-        }
-        errors = _check_cross_module_contracts(drafts)
-        assert len(errors) == 1
-        assert "1 positional" in errors[0]
-        assert "at least 2" in errors[0]
-
-    def test_too_many_args_detected(self) -> None:
-        drafts = {
-            "pkg/solver.py": (
-                "def find_energies(a: float, v0: float) -> list:\n"
-                "    return []\n"
-            ),
-            "pkg/cli.py": (
-                "from pkg.solver import find_energies\n"
-                "find_energies(1.0, 10.0, 'extra')\n"
-            ),
-        }
-        errors = _check_cross_module_contracts(drafts)
-        assert len(errors) == 1
-        assert "3 positional" in errors[0]
-        assert "at most 2" in errors[0]
-
-    def test_default_args_not_required(self) -> None:
-        drafts = {
-            "pkg/solver.py": (
-                "def find_energies(a: float, v0: float = 10.0) -> list:\n"
-                "    return []\n"
-            ),
-            "pkg/cli.py": (
-                "from pkg.solver import find_energies\n"
-                "find_energies(1.0)\n"
-            ),
-        }
-        assert _check_cross_module_contracts(drafts) == []
-
-    def test_ignores_external_imports(self) -> None:
-        """Calls to numpy/scipy should not be checked."""
-        drafts = {
-            "pkg/solver.py": (
-                "import numpy as np\n"
-                "def solve():\n    return np.array([1])\n"
-            ),
-        }
-        assert _check_cross_module_contracts(drafts) == []
-
-    def test_checks_test_files_too(self) -> None:
-        """Contract checks should also catch mismatches in test call sites."""
-        drafts = {
-            "pkg/solver.py": (
-                "def find_energies(a: float, v0: float) -> list:\n"
-                "    return [1.0]\n"
-            ),
-            "tests/test_solver.py": (
-                "from pkg.solver import find_energies\n"
-                "def test_it():\n"
-                "    energies, parities = find_energies(1.0, 10.0)\n"
-            ),
-        }
-        errors = _check_cross_module_contracts(drafts)
-        assert len(errors) == 1
-        assert "find_energies" in errors[0]
-
 class TestAdvancePhaseGroundTruth:
     def test_clears_ground_truth_on_advance(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -1171,49 +941,6 @@ class TestAdvancePhaseGroundTruth:
         result = advance_phase(state)
 
         assert result["ground_truth"] == []
-
-
-# ---------------------------------------------------------------------------
-# _check_duplicate_modules
-# ---------------------------------------------------------------------------
-
-class TestCheckDuplicateModules:
-    def test_no_duplicates_flat_layout(self) -> None:
-        drafts = {
-            "my_pkg/__init__.py": "",
-            "my_pkg/solver.py": "def solve(): pass\n",
-            "tests/test_solver.py": "def test_it(): pass\n",
-        }
-        assert _check_duplicate_modules(drafts) == []
-
-    def test_no_duplicates_src_layout(self) -> None:
-        drafts = {
-            "src/my_pkg/__init__.py": "",
-            "src/my_pkg/solver.py": "def solve(): pass\n",
-            "tests/test_solver.py": "def test_it(): pass\n",
-        }
-        assert _check_duplicate_modules(drafts) == []
-
-    def test_detects_duplicate_layout(self) -> None:
-        drafts = {
-            "square_well/__init__.py": "",
-            "square_well/solver.py": "def solve(): pass\n",
-            "src/square_well/__init__.py": "",
-            "src/square_well/solver.py": "def solve(): pass\n",
-            "tests/test_solver.py": "def test_it(): pass\n",
-        }
-        errors = _check_duplicate_modules(drafts)
-        assert len(errors) == 1
-        assert "square_well" in errors[0]
-        assert "Duplicate layout" in errors[0]
-
-    def test_ignores_tests_directory(self) -> None:
-        """tests/ should not be flagged as a flat-layout package."""
-        drafts = {
-            "src/my_pkg/__init__.py": "",
-            "tests/test_solver.py": "def test_it(): pass\n",
-        }
-        assert _check_duplicate_modules(drafts) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1426,6 +1153,28 @@ class TestCoderErrorContext:
 
 class TestStuckLoopDetection:
     """Verifier tracks consecutive identical error fingerprints."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_triage_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """LLM triage detects MISSING imports, returns LGTM for clean code."""
+        class _TriageLLM:
+            def invoke(self, messages: Any) -> Any:
+                # Inspect the user message for MISSING imports
+                user_msg = messages[-1].content if messages else ""
+                msg = MagicMock()
+                if "MISSING_A" in user_msg:
+                    msg.content = "- Import mismatch: MISSING_A is not defined"
+                elif "MISSING_B" in user_msg:
+                    msg.content = "- Import mismatch: MISSING_B is not defined"
+                elif "MISSING" in user_msg:
+                    msg.content = "- Import mismatch: MISSING is not defined"
+                else:
+                    msg.content = "LGTM"
+                return msg
+
+        monkeypatch.setattr(
+            "orchestrator.nodes.get_llm", lambda: _TriageLLM()
+        )
 
     def test_first_failure_sets_count_to_one(self) -> None:
         state = _base_state(
@@ -1799,6 +1548,151 @@ class TestCheckPyprojectToml:
         combined = " ".join(errors)
         assert "requires" in combined
         assert "build-backend" in combined
+
+
+# ---------------------------------------------------------------------------
+# _llm_triage
+# ---------------------------------------------------------------------------
+
+
+class TestLlmTriage:
+    """LLM triage replaces the old AST-based heuristics with a single LLM call."""
+
+    def test_returns_empty_on_lgtm(self) -> None:
+        """LGTM response means no structural issues."""
+        llm = _FakeLLM("LGTM")
+        drafts = {
+            "solver.py": "def solve(): pass\n",
+            "tests/test_solver.py": "from solver import solve\ndef test_it(): solve()\n",
+        }
+        assert _llm_triage(drafts, llm) == []
+
+    def test_returns_empty_on_blank(self) -> None:
+        """Empty LLM response treated as no issues."""
+        llm = _FakeLLM("")
+        drafts = {"solver.py": "def solve(): pass\n"}
+        assert _llm_triage(drafts, llm) == []
+
+    def test_parses_bullet_issues(self) -> None:
+        """Bullet-point issues are extracted as separate errors."""
+        llm = _FakeLLM(
+            "- Import mismatch: tests/test_solver.py imports 'foo' from 'solver'\n"
+            "- Contract mismatch in tests/test_solver.py: too few args\n"
+        )
+        drafts = {
+            "solver.py": "def solve(): pass\n",
+            "tests/test_solver.py": "from solver import foo\ndef test_it(): foo()\n",
+        }
+        errors = _llm_triage(drafts, llm)
+        assert len(errors) == 2
+        assert "Import mismatch" in errors[0]
+        assert "Contract mismatch" in errors[1]
+
+    def test_skips_non_py_files(self) -> None:
+        """Non-.py files should not be sent to LLM."""
+        llm = _FakeLLM("LGTM")
+        drafts = {"pyproject.toml": "[project]\nname='x'\n"}
+        assert _llm_triage(drafts, llm) == []
+
+    def test_non_bullet_lines_included(self) -> None:
+        """Non-header, non-empty lines are captured too."""
+        llm = _FakeLLM("Layout conflict detected in solver.py")
+        drafts = {"solver.py": "x = 1\n"}
+        errors = _llm_triage(drafts, llm)
+        assert len(errors) == 1
+        assert "Layout conflict" in errors[0]
+
+    def test_header_lines_skipped(self) -> None:
+        """Lines starting with # should be ignored."""
+        llm = _FakeLLM("# Issues found\n- Bad import in test.py")
+        drafts = {"solver.py": "x = 1\n", "tests/test_solver.py": "pass\n"}
+        errors = _llm_triage(drafts, llm)
+        assert len(errors) == 1
+        assert "Bad import" in errors[0]
+
+
+class TestLlmTriageInVerifier:
+    """Verifier integrates LLM triage for code with no syntax/TOML errors."""
+
+    def test_triage_errors_short_circuit_pytest(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When LLM triage finds issues, pytest should not run."""
+        triage_response = "- Import mismatch: tests/test_mod.py imports 'missing' from 'pkg.mod'"
+        monkeypatch.setattr(
+            "orchestrator.nodes.get_llm", lambda: _FakeLLM(triage_response)
+        )
+        state = _base_state(
+            code_drafts={
+                "pkg/__init__.py": "",
+                "pkg/mod.py": "def solve(): pass\n",
+                "tests/test_mod.py": (
+                    "from pkg.mod import missing\n"
+                    "def test_it(): pass\n"
+                ),
+            },
+        )
+        result = verifier(state)
+        assert len(result["test_logs"]) == 1
+        assert "Import mismatch" in result["test_logs"][0]
+
+    def test_triage_lgtm_falls_through_to_pytest(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When triage says LGTM, pytest runs and tests pass."""
+        monkeypatch.setattr(
+            "orchestrator.nodes.get_llm", lambda: _FakeLLM("LGTM")
+        )
+        state = _base_state(
+            code_drafts={
+                "pkg/__init__.py": "",
+                "pkg/mod.py": "def solve(): return 42\n",
+                "tests/test_mod.py": (
+                    "from pkg.mod import solve\n"
+                    "def test_it():\n    assert solve() == 42\n"
+                ),
+            },
+        )
+        result = verifier(state)
+        assert result["test_logs"] == []
+
+    def test_syntax_errors_skip_triage(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Syntax errors short-circuit before LLM triage even runs."""
+        # LLM should NOT be called — raise if it is
+        def _should_not_call():
+            raise AssertionError("LLM should not be called for syntax errors")
+        monkeypatch.setattr("orchestrator.nodes.get_llm", _should_not_call)
+
+        state = _base_state(
+            code_drafts={
+                "pkg/__init__.py": "",
+                "pkg/mod.py": "def solve( pass\n",  # syntax error
+                "tests/test_mod.py": "def test_it(): pass\n",
+            },
+        )
+        result = verifier(state)
+        assert any("SyntaxError" in log for log in result["test_logs"])
+
+    def test_triage_transcript_entry(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Verifier transcript includes triage error information."""
+        triage_response = "- Duplicate layout: pkg exists in both flat and src"
+        monkeypatch.setattr(
+            "orchestrator.nodes.get_llm", lambda: _FakeLLM(triage_response)
+        )
+        state = _base_state(
+            code_drafts={
+                "pkg/__init__.py": "",
+                "pkg/mod.py": "def solve(): pass\n",
+                "tests/test_mod.py": "def test_it(): pass\n",
+            },
+        )
+        result = verifier(state)
+        assert len(result["transcript"]) == 1
+        assert "FAILED" in result["transcript"][0]["content"]
 
 
 # ---------------------------------------------------------------------------

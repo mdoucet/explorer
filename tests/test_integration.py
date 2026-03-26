@@ -69,8 +69,8 @@ class TestFullLoopSuccess:
     """The graph should converge in 1 iteration when code passes tests."""
 
     def test_single_iteration_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # The planner is called once, coder once. No reflector needed.
-        fake = _SequenceLLM([_PLAN_RESPONSE, _CODE_RESPONSE])
+        # The planner is called once, coder once, triage once. No reflector needed.
+        fake = _SequenceLLM([_PLAN_RESPONSE, _CODE_RESPONSE, "LGTM"])
         monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
 
         from src.cli import build_graph
@@ -116,14 +116,16 @@ def test_five():
         reflection = "The function returns a hardcoded -1 instead of computing the factorial."
         findings = "- The coder produced a stub instead of real logic"
 
-        # Sequence: plan → bad code → reflection → findings → good code
+        # Sequence: plan → bad code → triage → reflection → findings → good code → triage
         # (reflector routes directly to coder, skipping the planner on revision)
         fake = _SequenceLLM([
             _PLAN_RESPONSE,   # planner #1
             bad_code,          # coder #1 (will fail)
+            "LGTM",           # triage #1 (falls through to pytest)
             reflection,        # reflector (reflection)
             findings,          # reflector (findings extraction)
             _CODE_RESPONSE,   # coder #2 (will pass)
+            "LGTM",           # triage #2 (falls through to pytest)
         ])
         monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
 
@@ -177,7 +179,7 @@ def test_five():
     assert factorial(5) == 120
 ```
 """
-        fake = _SequenceLLM([_PLAN_RESPONSE, bad_code])
+        fake = _SequenceLLM([_PLAN_RESPONSE, bad_code, "LGTM"])
         monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
 
         checkpointer = make_checkpointer(db_path)
@@ -209,7 +211,7 @@ def test_five():
         assert run1_final.get("code_drafts"), "Expected code_drafts from first run"
 
         # --- Second run (resume): read full state, delete checkpoint, restart ---
-        fake2 = _SequenceLLM([_PLAN_RESPONSE, _CODE_RESPONSE])
+        fake2 = _SequenceLLM([_PLAN_RESPONSE, _CODE_RESPONSE, "LGTM"])
         monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake2)
 
         checkpointer2 = make_checkpointer(db_path)

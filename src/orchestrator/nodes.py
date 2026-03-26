@@ -910,253 +910,6 @@ def _ensure_importable(root: Path, code_drafts: dict[str, str]) -> None:
     )
 
 
-def _build_module_definitions(
-    code_drafts: dict[str, str],
-) -> tuple[dict[str, set[str]], dict[str, dict[str, ast.FunctionDef]]]:
-    """Build maps of module-level names and function AST nodes.
-
-    Returns ``(defined, func_defs)`` where:
-    - *defined*: ``{dotted_module: {name, ...}}``
-    - *func_defs*: ``{dotted_module: {func_name: FunctionDef_node, ...}}``
-    """
-    defined: dict[str, set[str]] = {}
-    func_defs: dict[str, dict[str, ast.FunctionDef]] = {}
-    for fpath, source in code_drafts.items():
-        if not fpath.endswith(".py"):
-            continue
-        basename = fpath.rsplit("/", 1)[-1] if "/" in fpath else fpath
-        if basename.startswith("test_") or basename == "__init__.py":
-            continue
-        try:
-            tree = ast.parse(source)
-        except SyntaxError:
-            continue
-        names: set[str] = set()
-        funcs: dict[str, ast.FunctionDef] = {}
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                names.add(node.name)
-                funcs[node.name] = node
-            elif isinstance(node, ast.ClassDef):
-                names.add(node.name)
-            elif isinstance(node, ast.Assign):
-                for t in node.targets:
-                    if isinstance(t, ast.Name):
-                        names.add(t.id)
-            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-                names.add(node.target.id)
-        mod_path = fpath.removesuffix(".py").replace("/", ".")
-        defined[mod_path] = names
-        func_defs[mod_path] = funcs
-        if mod_path.startswith("src."):
-            short = mod_path.removeprefix("src.")
-            defined[short] = names
-            func_defs[short] = funcs
-    return defined, func_defs
-
-
-def _check_import_consistency(code_drafts: dict[str, str]) -> list[str]:
-    """Check that names imported in test files are actually defined in source modules.
-
-    Returns a list of human-readable error strings (empty if consistent).
-    Only checks ``from <module> import <name>`` statements in test files
-    against top-level definitions in non-test ``.py`` files.
-    """
-    defined, _ = _build_module_definitions(code_drafts)
-
-    # Scan test files for `from X import Y` and cross-check
-    errors: list[str] = []
-    for fpath, source in code_drafts.items():
-        if not fpath.endswith(".py"):
-            continue
-        basename = fpath.rsplit("/", 1)[-1] if "/" in fpath else fpath
-        if not basename.startswith("test_"):
-            continue
-        try:
-            tree = ast.parse(source)
-        except SyntaxError:
-            continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom) or node.module is None:
-                continue
-            mod = node.module
-            # Flag `from src.pkg...` imports — they never work at runtime
-            if mod.startswith("src."):
-                correct = mod.removeprefix("src.")
-                errors.append(
-                    f"Bad import path: {fpath} uses 'from {mod} import ...', "
-                    f"but 'src' is not a package. Use 'from {correct} import ...' instead."
-                )
-                continue
-            if mod not in defined:
-                continue
-            for alias in node.names:
-                name = alias.name
-                if name not in defined[mod]:
-                    available = ", ".join(sorted(defined[mod])) or "(nothing)"
-                    errors.append(
-                        f"Import mismatch: {fpath} imports '{name}' from "
-                        f"'{mod}', but '{mod}' only defines: {available}"
-                    )
-    return errors
-
-
-# ------------------------------------------------------------------
-# Cross-module contract checking
-# ------------------------------------------------------------------
-
-def _count_return_elements(func_node: ast.FunctionDef) -> int | None:
-    """Determine the tuple length of a function's return value.
-
-    Returns:
-    - ``1`` if every ``return`` yields a single (non-tuple) value
-    - ``N`` if every ``return`` yields a tuple of *N* elements
-    - ``None`` if there are no returns, mixed lengths, or bare returns
-    """
-    counts: set[int] = set()
-    for node in ast.walk(func_node):
-        if isinstance(node, ast.Return) and node.value is not None:
-            if isinstance(node.value, ast.Tuple):
-                counts.add(len(node.value.elts))
-            else:
-                counts.add(1)
-    if len(counts) == 1:
-        return counts.pop()
-    return None
-
-
-def _min_positional_args(func_node: ast.FunctionDef) -> int:
-    """Return the minimum number of positional arguments (excluding *self*)."""
-    args = func_node.args
-    n_total = len(args.args)
-    # Subtract `self` / `cls` for methods (heuristic: first arg named self/cls)
-    if n_total and args.args[0].arg in ("self", "cls"):
-        n_total -= 1
-    n_defaults = len(args.defaults)
-    return n_total - n_defaults
-
-
-def _max_positional_args(func_node: ast.FunctionDef) -> int | None:
-    """Return the max positional arguments, or ``None`` if ``*args`` is present."""
-    args = func_node.args
-    if args.vararg:
-        return None
-    n_total = len(args.args)
-    if n_total and args.args[0].arg in ("self", "cls"):
-        n_total -= 1
-    return n_total
-
-
-def _check_cross_module_contracts(code_drafts: dict[str, str]) -> list[str]:
-    """Detect mismatches between function call sites and definitions across modules.
-
-    Catches two classes of bugs:
-    1. **Return-value unpacking mismatch** — e.g. ``a, b = func()`` when
-       ``func`` returns a single value (or vice-versa).
-    2. **Argument count mismatch** — too many or too few positional args
-       at a call site compared to the function definition.
-
-    Only checks calls to functions *imported* from other source modules in
-    the project (not stdlib / third-party).
-    """
-    defined, func_defs = _build_module_definitions(code_drafts)
-    errors: list[str] = []
-
-    for fpath, source in code_drafts.items():
-        if not fpath.endswith(".py"):
-            continue
-        try:
-            tree = ast.parse(source)
-        except SyntaxError:
-            continue
-
-        # Map imported names → (module, original_name)
-        imported: dict[str, tuple[str, str]] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module in func_defs:
-                for alias in node.names:
-                    local = alias.asname or alias.name
-                    imported[local] = (node.module, alias.name)
-
-        if not imported:
-            continue
-
-        # Walk the AST looking for calls to imported functions
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            # Simple call: func_name(...)
-            if isinstance(node.func, ast.Name) and node.func.id in imported:
-                mod, orig_name = imported[node.func.id]
-                fdef = func_defs[mod].get(orig_name)
-                if fdef is None:
-                    continue
-
-                # --- Argument count check ---
-                n_pos = len(node.args)
-                has_starargs = any(
-                    isinstance(a, ast.Starred) for a in node.args
-                )
-                if not has_starargs:
-                    min_args = _min_positional_args(fdef)
-                    max_args = _max_positional_args(fdef)
-                    if n_pos < min_args:
-                        errors.append(
-                            f"Contract mismatch in {fpath}: "
-                            f"call to '{orig_name}()' passes {n_pos} "
-                            f"positional arg(s) but it requires at least "
-                            f"{min_args}"
-                        )
-                    elif max_args is not None and n_pos > max_args:
-                        errors.append(
-                            f"Contract mismatch in {fpath}: "
-                            f"call to '{orig_name}()' passes {n_pos} "
-                            f"positional arg(s) but it accepts at most "
-                            f"{max_args}"
-                        )
-
-                # --- Return-value unpacking check ---
-                # Walk parent assignments to find unpacking
-                _check_return_unpacking(
-                    tree, node, fdef, orig_name, fpath, errors
-                )
-
-    return errors
-
-
-def _check_return_unpacking(
-    tree: ast.Module,
-    call_node: ast.Call,
-    func_def: ast.FunctionDef,
-    func_name: str,
-    fpath: str,
-    errors: list[str],
-) -> None:
-    """Check if a call's return-value unpacking matches the function definition."""
-    ret_count = _count_return_elements(func_def)
-    if ret_count is None:
-        return  # Can't determine return shape — skip
-
-    # Find Assign/AnnAssign nodes that contain this exact call
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and node.value is call_node:
-            target = node.targets[0] if len(node.targets) == 1 else None
-            if isinstance(target, ast.Tuple):
-                unpack_count = len(target.elts)
-                if unpack_count != ret_count:
-                    errors.append(
-                        f"Contract mismatch in {fpath}: "
-                        f"'{func_name}()' returns {ret_count} value(s) "
-                        f"but call site unpacks into {unpack_count}"
-                    )
-            elif target is not None and ret_count > 1:
-                errors.append(
-                    f"Contract mismatch in {fpath}: "
-                    f"'{func_name}()' returns a tuple of {ret_count} "
-                    f"values but call site assigns to a single variable"
-                )
-
-
 def _check_syntax(code_drafts: dict[str, str]) -> list[str]:
     """Check every ``.py`` draft for syntax errors using ``ast.parse``.
 
@@ -1256,6 +1009,52 @@ def _check_pyproject_toml(code_drafts: dict[str, str]) -> list[str]:
     return errors
 
 
+def _llm_triage(code_drafts: dict[str, str], llm: Any) -> list[str]:
+    """Use the LLM to review code drafts for structural issues before pytest.
+
+    Replaces the deterministic ``_check_import_consistency``,
+    ``_check_cross_module_contracts``, and ``_check_duplicate_modules``
+    heuristics with a single LLM call that catches the same classes of
+    bugs (import mismatches, argument-count errors, return-unpacking
+    mismatches, layout conflicts) plus issues the heuristics couldn't.
+
+    Returns a list of human-readable error strings (empty if LLM says OK).
+    """
+    prompt = _load_prompt("EXPLORER_PROMPT_TRIAGE", "triage.md")
+
+    # Build a concise code listing for the LLM
+    sections: list[str] = []
+    for fpath in sorted(code_drafts):
+        if not fpath.endswith(".py"):
+            continue
+        sections.append(f"### {fpath}\n```python\n{code_drafts[fpath]}\n```")
+
+    if not sections:
+        return []
+
+    user_msg = "## Code files to review\n\n" + "\n\n".join(sections)
+
+    response = _invoke_llm(llm, [
+        SystemMessage(content=prompt),
+        HumanMessage(content=user_msg),
+    ])
+    text = response.content.strip()
+
+    if text == "LGTM" or not text:
+        return []
+
+    # Parse bullet-point issues
+    errors: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("- "):
+            errors.append(line[2:])
+        elif line and not line.startswith("#"):
+            # Non-empty, non-header line — include as-is
+            errors.append(line)
+    return errors
+
+
 def _warn_stale_files(
     root: Path, code_drafts: dict[str, str]
 ) -> None:
@@ -1272,34 +1071,6 @@ def _warn_stale_files(
         if py_file not in expected:
             logger.warning("Removing stale file: %s", py_file)
             py_file.unlink()
-
-
-def _check_duplicate_modules(code_drafts: dict[str, str]) -> list[str]:
-    """Detect packages that appear in both flat and ``src/`` layouts.
-
-    For example, if *code_drafts* contains both ``pkg/mod.py`` and
-    ``src/pkg/mod.py`` (or even just ``pkg/__init__.py`` and
-    ``src/pkg/__init__.py``), this is almost certainly a mistake that will
-    confuse Python's import system.
-
-    Returns a list of human-readable error strings (empty if no duplicates).
-    """
-    flat_pkgs: set[str] = set()
-    src_pkgs: set[str] = set()
-    for fpath in code_drafts:
-        parts = fpath.split("/")
-        if len(parts) >= 2 and parts[0] == "src":
-            src_pkgs.add(parts[1])
-        elif len(parts) >= 2 and parts[0] != "tests":
-            flat_pkgs.add(parts[0])
-
-    dupes = flat_pkgs & src_pkgs
-    return [
-        f"Duplicate layout: package '{pkg}' exists in both '{pkg}/' (flat) "
-        f"and 'src/{pkg}/' (src layout). Use only ONE layout — remove the "
-        f"duplicate and ensure all imports match the chosen layout."
-        for pkg in sorted(dupes)
-    ]
 
 
 def _resolve_duplicate_layouts(
@@ -1384,11 +1155,11 @@ def verifier(state: ScientificState) -> dict[str, Any]:
     pre_errors = _check_pyproject_toml(code_drafts)
     pre_errors += syntax_errors
     if not pre_errors:
-        pre_errors = _check_duplicate_modules(code_drafts)
-    if not pre_errors:
-        pre_errors = _check_import_consistency(code_drafts)
-    if not pre_errors:
-        pre_errors = _check_cross_module_contracts(code_drafts)
+        # LLM triage replaces the old AST-based heuristics
+        # (_check_duplicate_modules, _check_import_consistency,
+        #  _check_cross_module_contracts).
+        llm = get_llm()
+        pre_errors = _llm_triage(code_drafts, llm)
 
     # Track which files are clean (no syntax or import errors)
     files_with_errors: set[str] = set()
