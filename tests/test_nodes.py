@@ -12,6 +12,7 @@ from orchestrator.nodes import (
     _check_pyproject_toml,
     _check_syntax,
     _ensure_importable,
+    _extract_action,
     _extract_findings,
     _llm_triage,
     _pick_replan_phase,
@@ -420,7 +421,9 @@ class TestReflector:
         fake = _FakeLLM(
             "The factorial function always returns -1.\n\n"
             "## Key Findings\n"
-            "- The function uses a hardcoded return value instead of recursion"
+            "- The function uses a hardcoded return value instead of recursion\n\n"
+            "## Action\n"
+            "RETRY"
         )
         monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
 
@@ -431,6 +434,7 @@ class TestReflector:
         assert "-1" in result["reflection"]
         assert "ground_truth" in result
         assert len(result["ground_truth"]) >= 1
+        assert result["_reflector_action"] == "retry"
 
 
 # ---------------------------------------------------------------------------
@@ -1037,7 +1041,7 @@ class TestCoderErrorContext:
     def test_revision_protects_clean_test_files(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """On revision iterations with phase_error_count >= 2,
+        """On revision iterations with phase_iteration_count >= 2,
         test files that are in clean_files must not be overwritten."""
         # The coder emits both solver.py and test_solver.py
         llm_output = (
@@ -1051,7 +1055,7 @@ class TestCoderErrorContext:
         state = _base_state(
             plan="fix solver",
             reflection="Return value is wrong.",
-            _phase_error_count=2,
+            _phase_iteration_count=2,
             code_drafts={
                 "solver.py": "def solve(): return -1\n",
                 "tests/test_solver.py": original_test,
@@ -1069,7 +1073,7 @@ class TestCoderErrorContext:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Test files that are NOT in clean_files should be updatable by the
-        coder, even after phase_error_count >= 2.  This ensures test infrastructure
+        coder, even after phase_iteration_count >= 2.  This ensures test infrastructure
         bugs (e.g. wrong subprocess invocation) can be fixed."""
         fixed_test = "import subprocess, sys\ndef run_cli(args):\n    return subprocess.run([sys.executable, '-m', 'pkg.cli'] + args, capture_output=True, text=True)\ndef test_cli(): assert run_cli(['--help']).returncode == 0\n"
         llm_output = (
@@ -1083,7 +1087,7 @@ class TestCoderErrorContext:
         state = _base_state(
             plan="fix CLI",
             reflection="ImportError: relative import with no known parent package.",
-            _phase_error_count=3,
+            _phase_iteration_count=3,
             code_drafts={
                 "pkg/cli.py": "from .solver import solve\nprint('hello')\n",
                 "tests/test_cli.py": buggy_test,
@@ -1098,7 +1102,7 @@ class TestCoderErrorContext:
     def test_first_revision_allows_test_fixes(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """On the first revision (phase_error_count < 2), test files should
+        """On the first revision (phase_iteration_count < 2), test files should
         NOT be protected — the coder needs one chance to fix bad tests."""
         rewritten_test = "from solver import solve\ndef test_it(): assert solve() == 42\n"
         llm_output = (
@@ -1111,7 +1115,7 @@ class TestCoderErrorContext:
         state = _base_state(
             plan="fix solver",
             reflection="Tests are wrong — assert len==0 but always >=1 bound state.",
-            _phase_error_count=1,
+            _phase_iteration_count=1,
             code_drafts={
                 "solver.py": "def solve(): return -1\n",
                 "tests/test_solver.py": "assert False  # wrong tests\n",
@@ -1255,36 +1259,32 @@ class TestStuckLoopDetection:
         assert result["_error_repeat_count"] == 0
         assert result["_prev_error_fingerprint"] == ""
 
-    def test_phase_error_count_increments_on_failure(self) -> None:
-        state = _base_state(
-            code_drafts={
-                "pkg/__init__.py": "",
-                "pkg/mod.py": "def solve(): pass\n",
-                "tests/test_mod.py": (
-                    "from pkg.mod import MISSING\n"
-                    "def test_it(): pass\n"
-                ),
-            },
-            _phase_error_count=3,
-        )
-        result = verifier(state)
-        assert result["_phase_error_count"] == 4
 
-    def test_phase_error_count_unchanged_on_pass(self) -> None:
-        state = _base_state(
-            code_drafts={
-                "pkg/__init__.py": "",
-                "pkg/mod.py": "def solve(): pass\n",
-                "tests/test_mod.py": (
-                    "from pkg.mod import solve\n"
-                    "def test_it():\n"
-                    "    assert solve() is None\n"
-                ),
-            },
-            _phase_error_count=2,
-        )
-        result = verifier(state)
-        assert result["_phase_error_count"] == 2
+# ---------------------------------------------------------------------------
+# _extract_action
+# ---------------------------------------------------------------------------
+
+class TestExtractAction:
+    """_extract_action parses the ## Action recommendation from reflector output."""
+
+    def test_returns_retry_by_default(self) -> None:
+        assert _extract_action("Some analysis without an action section.") == "retry"
+
+    def test_parses_retry(self) -> None:
+        text = "Analysis.\n\n## Key Findings\n- F1\n\n## Action\nRETRY"
+        assert _extract_action(text) == "retry"
+
+    def test_parses_replan(self) -> None:
+        text = "Analysis.\n\n## Key Findings\n- F1\n\n## Action\nREPLAN"
+        assert _extract_action(text) == "replan"
+
+    def test_case_insensitive(self) -> None:
+        text = "Analysis.\n\n## Action\nReplan"
+        assert _extract_action(text) == "replan"
+
+    def test_empty_action_section_defaults_to_retry(self) -> None:
+        text = "Analysis.\n\n## Action\n"
+        assert _extract_action(text) == "retry"
 
 
 # ---------------------------------------------------------------------------
@@ -1940,47 +1940,14 @@ class TestShouldContinue:
         )
         assert fn(state) == "advance_phase"
 
-    def test_phase_cap_with_replans_remaining_returns_reflect(self) -> None:
-        """When phase cap exceeded but replans remain, route to reflect
-        (so _after_reflector can trigger a forced replan)."""
-        from src.cli import _make_should_continue, MAX_PHASE_ITERATIONS
+    def test_tests_failed_returns_reflect(self) -> None:
+        from src.cli import _make_should_continue
 
-        fn = _make_should_continue(40)
+        fn = _make_should_continue(20)
         state = _base_state(
             test_logs=["FAILED test_a"],
             plan_phases=[{"id": 1, "title": "P1"}, {"id": 2, "title": "P2"}],
             current_phase=0,
-            _phase_iteration_count=MAX_PHASE_ITERATIONS,
-            _replan_count=0,
-        )
-        assert fn(state) == "reflect"
-
-    def test_phase_cap_with_replans_exhausted_returns_advance(self) -> None:
-        """When phase cap exceeded AND replans exhausted, force-advance."""
-        from src.cli import _make_should_continue, MAX_PHASE_ITERATIONS, MAX_REPLANS
-
-        fn = _make_should_continue(40)
-        state = _base_state(
-            test_logs=["FAILED test_a"],
-            plan_phases=[{"id": 1, "title": "P1"}, {"id": 2, "title": "P2"}],
-            current_phase=0,
-            _phase_iteration_count=MAX_PHASE_ITERATIONS,
-            _replan_count=MAX_REPLANS,
-        )
-        assert fn(state) == "advance_phase"
-
-    def test_phase_cap_collection_error_returns_reflect(self) -> None:
-        """Collection errors never force-advance — always reflect."""
-        from src.cli import _make_should_continue, MAX_PHASE_ITERATIONS, MAX_REPLANS
-
-        fn = _make_should_continue(40)
-        state = _base_state(
-            test_logs=["ERRORS: collection failed"],
-            plan_phases=[{"id": 1, "title": "P1"}, {"id": 2, "title": "P2"}],
-            current_phase=0,
-            _phase_iteration_count=MAX_PHASE_ITERATIONS,
-            _replan_count=MAX_REPLANS,
-            _collection_error=True,
         )
         assert fn(state) == "reflect"
 
@@ -2000,76 +1967,32 @@ class TestShouldContinue:
 # ---------------------------------------------------------------------------
 
 class TestAfterReflector:
-    """The _after_reflector routing should send to planner when total phase
-    failures hit the threshold, and to coder otherwise."""
+    """The _after_reflector routing uses the reflector's ## Action recommendation."""
 
-    def test_routes_to_coder_below_threshold(self) -> None:
+    def test_routes_to_coder_on_retry(self) -> None:
         from src.cli import _after_reflector
 
-        state = _base_state(_phase_error_count=2)
+        state = _base_state(_reflector_action="retry")
         assert _after_reflector(state) == "coder"
 
-    def test_routes_to_replan_at_threshold(self) -> None:
-        from src.cli import _after_reflector, REPLAN_THRESHOLD
+    def test_routes_to_replan_on_replan(self) -> None:
+        from src.cli import _after_reflector
 
-        state = _base_state(_phase_error_count=REPLAN_THRESHOLD)
+        state = _base_state(_reflector_action="replan", _replan_count=0)
         assert _after_reflector(state) == "replan"
 
-    def test_routes_to_replan_above_threshold(self) -> None:
-        from src.cli import _after_reflector, REPLAN_THRESHOLD
-
-        state = _base_state(_phase_error_count=REPLAN_THRESHOLD + 2)
-        assert _after_reflector(state) == "replan"
-
-    def test_routes_to_coder_when_no_error_count(self) -> None:
+    def test_routes_to_coder_when_no_action(self) -> None:
         from src.cli import _after_reflector
 
         state = _base_state()
         assert _after_reflector(state) == "coder"
 
-    def test_routes_to_coder_when_replan_exhausted(self) -> None:
-        """After MAX_REPLANS, even if error threshold is hit, route to coder."""
-        from src.cli import _after_reflector, MAX_REPLANS, REPLAN_THRESHOLD
+    def test_routes_to_coder_when_replans_exhausted(self) -> None:
+        """After MAX_REPLANS, even if reflector says replan, route to coder."""
+        from src.cli import _after_reflector, MAX_REPLANS
 
         state = _base_state(
-            _phase_error_count=REPLAN_THRESHOLD,
-            _replan_count=MAX_REPLANS,
-        )
-        assert _after_reflector(state) == "coder"
-
-    def test_oscillating_errors_still_trigger_replan(self) -> None:
-        """When errors are different each iteration (repeat count stays at 1),
-        but phase error count accumulates, replan should still trigger."""
-        from src.cli import _after_reflector, REPLAN_THRESHOLD
-
-        # Simulates: 3 failures with _error_repeat_count=1 (all different)
-        # but _phase_error_count=3 (total failures monotonically counted)
-        state = _base_state(
-            _error_repeat_count=1,
-            _phase_error_count=REPLAN_THRESHOLD,
-        )
-        assert _after_reflector(state) == "replan"
-
-    def test_force_replan_when_phase_cap_exceeded(self) -> None:
-        """When phase iteration cap is exceeded and replans remain,
-        force a replan regardless of error count threshold."""
-        from src.cli import _after_reflector, MAX_PHASE_ITERATIONS
-
-        state = _base_state(
-            _phase_error_count=1,  # below normal threshold
-            _phase_iteration_count=MAX_PHASE_ITERATIONS,
-            _replan_count=0,
-        )
-        assert _after_reflector(state) == "replan"
-
-    def test_no_force_replan_when_replans_exhausted(self) -> None:
-        """When phase cap exceeded but replans are exhausted, route to coder
-        (force-advance will happen in _should_continue instead)."""
-        from src.cli import _after_reflector, MAX_PHASE_ITERATIONS, MAX_REPLANS
-
-        state = _base_state(
-            _phase_error_count=10,
-            _phase_iteration_count=MAX_PHASE_ITERATIONS,
+            _reflector_action="replan",
             _replan_count=MAX_REPLANS,
         )
         assert _after_reflector(state) == "coder"
@@ -2291,7 +2214,7 @@ class TestCleanFileProtection:
             test_logs=["FAILED tests/test_wf.py - assert False"],
             reflection="The wavefunctions module has errors.",
             clean_files=["pkg/solver.py"],
-            _phase_error_count=3,
+            _phase_iteration_count=3,
         )
         result = coder(state)
 
@@ -2315,7 +2238,7 @@ class TestCleanFileProtection:
             code_drafts={"pkg/solver.py": "broken code"},
             test_logs=["FAILED tests/test_solver.py - assert False"],
             clean_files=[],  # solver is NOT clean
-            _phase_error_count=3,
+            _phase_iteration_count=3,
         )
         result = coder(state)
 

@@ -116,7 +116,9 @@ def test_five():
         reflection = (
             "The function returns a hardcoded -1 instead of computing the factorial.\n\n"
             "## Key Findings\n"
-            "- The coder produced a stub instead of real logic"
+            "- The coder produced a stub instead of real logic\n\n"
+            "## Action\n"
+            "RETRY"
         )
 
         # Sequence: plan → bad code → triage → reflection (with findings) → good code → triage

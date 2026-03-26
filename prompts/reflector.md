@@ -32,3 +32,15 @@ If there is nothing noteworthy beyond what is already known, write
 Do NOT repeat or rephrase findings that already appear in the run history.
 Only add findings that are genuinely NEW — a different root cause,
 a different variable, or a different algorithmic insight.
+
+## Action
+
+After the Key Findings section, end your response with a `## Action` line
+followed by exactly one of these words on the next line:
+
+- **RETRY** — the coder can fix this with the patch you suggested above.
+  Use this when the root cause is clear and a concrete code change will fix it.
+- **REPLAN** — the current approach is fundamentally wrong and the planner
+  should redesign this phase with a different algorithm or decomposition.
+  Use this when multiple iterations have failed with the same class of error,
+  or when the architectural approach is flawed.

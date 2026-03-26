@@ -575,3 +575,24 @@ Four fixes re-applied on top of `7a8565d` ("update for larger LLMs"), addressing
 - nodes.py: 1395 → 1416 lines (net +21 from `_extract_findings` helper; -1 LLM call removed)
 - Tests: 195 → 199 (4 new `_extract_findings` tests, 1 replaced `test_existing_findings_passed_to_llm` → `test_no_findings_when_none`)
 - Integration test LLM sequence reduced from 7 to 6 calls (removed separate findings extraction call)
+
+## Phase 4: Simplify Graph Routing (LLM-Informed Decisions)
+
+- **Problem:** Post-reflector routing used counter-based heuristics: `_phase_error_count >= REPLAN_THRESHOLD * 2^_replan_count` to decide when to replan, `MAX_PHASE_ITERATIONS` to force-advance phases, and `verified_fixes` keyword matching to inject constraints into the coder. These were brittle, hard to tune, and couldn't adapt to context.
+- **Fix:** The reflector now outputs a `## Action` section at the end of its response with exactly `RETRY` or `REPLAN`. A new `_extract_action()` helper parses this, and `_after_reflector()` uses the LLM's recommendation (capped by `MAX_REPLANS`) instead of counter thresholds.
+- **Removed constants:** `REPLAN_THRESHOLD`, `MAX_PHASE_ITERATIONS` from `cli.py`.
+- **Removed state fields:** `_phase_error_count`, `_prev_syntax_file_count`, `verified_fixes`, `best_code_drafts`, `best_error_count` (5 fields removed from `ScientificState`).
+- **Added state field:** `_reflector_action: str` — stores `"retry"` or `"replan"` from the reflector's `## Action` section.
+- **New helper:** `_extract_action(text) -> str` in `nodes.py` — parses `## Action` header, returns `"replan"` or `"retry"` (default).
+- **Updated helper:** `_extract_findings()` now strips the `## Action` section before parsing findings.
+- **Simplified `_should_continue()`:** 3 outcomes only — `end` (tests pass, all done), `advance_phase` (tests pass, more phases), `reflect` (tests fail). Removed force-advance and phase-cap logic.
+- **Simplified `_after_reflector()`:** Reads `_reflector_action` and `_replan_count`. If `replan` and replans remaining → replan; otherwise → coder.
+- **Removed from verifier:** `verified_fixes` keyword matching, rollback/best-draft tracking (`best_code_drafts`, `best_error_count`), `_phase_error_count` tracking, `_prev_syntax_file_count` tracking.
+- **Removed from coder:** `verified_fixes` injection ("⚠️ MANDATORY CONSTRAINTS" section).
+- **Coder clean-file protection:** Now uses `_phase_iteration_count >= 2` instead of removed `_phase_error_count >= 2`.
+
+### Impact
+- State fields: 25 → 21 (removed 5, added 1)
+- cli.py: Removed 2 constants, simplified 2 routing functions
+- nodes.py: Removed ~50 lines of heuristic code, added ~15 lines for `_extract_action`
+- Tests: 199 → 196 (removed 13 counter-based tests, added 10 LLM-routing tests)

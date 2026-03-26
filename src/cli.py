@@ -34,8 +34,6 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 MAX_ITERATIONS = int(os.environ.get("EXPLORER_MAX_ITERATIONS", "20"))  # 0 = unlimited
-REPLAN_THRESHOLD = 3  # N total phase failures → re-engage planner
-MAX_PHASE_ITERATIONS = 8  # max iterations per single phase before force-advancing
 
 
 # ---------------------------------------------------------------------------
@@ -45,11 +43,9 @@ MAX_PHASE_ITERATIONS = 8  # max iterations per single phase before force-advanci
 def _make_should_continue(max_iters: int):
     """Return a conditional edge function with a configurable iteration cap.
 
-    Four outcomes:
+    Three outcomes:
     - ``"end"``           — tests passed and all phases are done
     - ``"advance_phase"`` — tests passed but more phases remain
-    - ``"advance_phase"`` — per-phase iteration cap exceeded AND replans
-                            exhausted (force-advance as last resort)
     - ``"reflect"``       — tests failed and we haven't hit the cap
     """
     def _should_continue(state: ScientificState) -> str:
@@ -62,37 +58,6 @@ def _make_should_continue(max_iters: int):
             return "end"
         if max_iters > 0 and state.get("iteration_count", 0) >= max_iters:
             return "end"
-        # Per-phase iteration cap: if stuck too long on one phase, prefer
-        # replanning first.  Only force-advance as a last resort (when
-        # replans are also exhausted) to avoid carrying broken tests to
-        # the next phase.
-        # Never force-advance on collection errors (no tests ran at all).
-        phase_iters = state.get("_phase_iteration_count", 0)
-        phases = state.get("plan_phases") or []
-        current = state.get("current_phase", 0)
-        is_collection_error = state.get("_collection_error", False)
-        replan_count = state.get("_replan_count", 0)
-        if (
-            phase_iters >= MAX_PHASE_ITERATIONS
-            and phases
-            and current + 1 < len(phases)
-            and not is_collection_error
-        ):
-            if replan_count < MAX_REPLANS:
-                # Still have replans available — let the reflector trigger one
-                logger.warning(
-                    "Phase %d exceeded %d iterations — routing to reflector "
-                    "(replans remaining: %d)",
-                    current, MAX_PHASE_ITERATIONS, MAX_REPLANS - replan_count,
-                )
-                return "reflect"
-            # Replans exhausted — force-advance as last resort
-            logger.warning(
-                "Phase %d exceeded %d iterations and replans exhausted "
-                "— force-advancing to next phase",
-                current, MAX_PHASE_ITERATIONS,
-            )
-            return "advance_phase"
         return "reflect"
     return _should_continue
 
@@ -101,36 +66,16 @@ MAX_REPLANS = 2  # max replans per phase before giving up on replanning
 
 
 def _after_reflector(state: ScientificState) -> str:
-    """Route after the reflector: re-plan on persistent failures.
+    """Route after the reflector using the LLM's own recommendation.
 
-    If the total number of failures in the current phase reaches
-    the replan threshold, the coder is clearly stuck — send the problem back
-    to the planner so it can decompose the current phase differently or
-    suggest a new algorithm.
-
-    The replan threshold uses exponential backoff: 3 errors for the first
-    replan, 6 for the second, etc.  This gives the coder more attempts
-    to self-recover after each replan before triggering another one.
-
-    Replanning is capped at ``MAX_REPLANS`` per phase to avoid infinite loops.
-
-    When the per-phase iteration cap is exceeded and replans remain,
-    a replan is forced immediately (bypassing the error-count threshold)
-    to give the planner a chance to decompose the problem differently
-    before the run force-advances.
+    The reflector's ``## Action`` section says ``REPLAN`` or ``RETRY``.
+    Replanning is capped at ``MAX_REPLANS`` per phase to avoid infinite
+    loops — once exhausted, always route to coder.
     """
-    phase_errors = state.get("_phase_error_count", 0)
     replan_count = state.get("_replan_count", 0)
-    phase_iters = state.get("_phase_iteration_count", 0)
-
-    if replan_count < MAX_REPLANS:
-        # Force replan when phase iteration cap exceeded
-        if phase_iters >= MAX_PHASE_ITERATIONS:
-            return "replan"
-        # Normal exponential-backoff replan trigger
-        current_threshold = REPLAN_THRESHOLD * (2 ** replan_count)
-        if phase_errors >= current_threshold:
-            return "replan"
+    action = state.get("_reflector_action", "retry")
+    if action == "replan" and replan_count < MAX_REPLANS:
+        return "replan"
     return "coder"
 
 

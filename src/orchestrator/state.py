@@ -51,19 +51,9 @@ class ScientificState(TypedDict, total=False):
         ``status`` (str), and ``files`` (list[str]).
     current_phase : int
         Zero-based index of the phase the coder is currently working on.
-    verified_fixes : list[str]
-        Cumulative list of constraints the coder must honour (e.g. "use raw
-        docstrings").  Populated by the verifier when a previously-failing
-        check passes after the reflector suggested a fix.
     clean_files : list[str]
         File paths that had no syntax or import errors on the last verifier
         run.  The coder is told not to modify these unless necessary.
-    best_code_drafts : dict[str, str]
-        Snapshot of ``code_drafts`` from the iteration with the fewest
-        errors in the current phase.  Used for rollback when the coder
-        regresses.
-    best_error_count : int
-        Number of errors in ``best_code_drafts``.  -1 means no snapshot yet.
     """
 
     task_description: str
@@ -82,14 +72,10 @@ class ScientificState(TypedDict, total=False):
     _prev_error_fingerprint: str
     _error_repeat_count: int
     _replan_count: int
-    _phase_error_count: int
     _phase_iteration_count: int
-    verified_fixes: list[str]
     clean_files: list[str]
-    best_code_drafts: dict[str, str]
-    best_error_count: int
-    _prev_syntax_file_count: int
     _collection_error: bool
+    _reflector_action: str
     transcript: list[dict]
 
 

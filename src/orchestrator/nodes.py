@@ -417,14 +417,9 @@ def advance_phase(state: ScientificState) -> dict[str, Any]:
         "_prev_error_fingerprint": "",  # reset for new phase
         "_error_repeat_count": 0,
         "_replan_count": 0,
-        "_phase_error_count": 0,
         "_phase_iteration_count": 0,
-        "_prev_syntax_file_count": 0,
         "_collection_error": False,
-        "verified_fixes": [],
         "clean_files": [],
-        "best_code_drafts": {},
-        "best_error_count": -1,
         "transcript": transcript,
     }
 
@@ -573,15 +568,6 @@ def coder(state: ScientificState) -> dict[str, Any]:
     if history:
         user_parts.append(history)
 
-    # Inject verified fixes as non-negotiable constraints
-    verified_fixes = state.get("verified_fixes") or []
-    if verified_fixes:
-        rules = "\n".join(f"- {f}" for f in verified_fixes)
-        user_parts.append(
-            f"## ⚠️ MANDATORY CONSTRAINTS (verified from prior iterations)\n"
-            f"These rules have been validated.  You MUST follow them:\n{rules}"
-        )
-
     # Determine if this is a revision iteration (has prior reflection).
     is_revision = bool(state.get("reflection"))
 
@@ -649,13 +635,13 @@ def coder(state: ScientificState) -> dict[str, Any]:
             del new_drafts[fp]
 
     # On revision iterations, protect files that are verified clean ONLY
-    # after the coder has already had one chance to fix (_phase_error_count >= 2).
+    # after the coder has already had one chance to fix (iteration >= 2).
     # Both test files and source files use the same criterion: only protect
     # files present in clean_files (all tests passing, no errors).
     # This ensures test files with bugs (e.g. wrong subprocess invocation)
     # can still be fixed while truly passing test files remain untouched.
-    phase_errors = state.get("_phase_error_count", 0)
-    if is_revision and existing_drafts and phase_errors >= 2:
+    phase_iter = state.get("_phase_iteration_count", 0)
+    if is_revision and existing_drafts and phase_iter >= 2:
         clean = set(state.get("clean_files") or [])
         protected = {fp for fp in clean if fp in existing_drafts}
         for fp in protected:
@@ -1206,53 +1192,7 @@ def verifier(state: ScientificState) -> dict[str, Any]:
     else:
         error_repeat_count = 1 if logs else 0
 
-    # Total failure count for this phase
-    phase_error_count = state.get("_phase_error_count", 0) + (1 if logs else 0)
     phase_iter_count = state.get("_phase_iteration_count", 0) + 1
-
-    # Count errors for best-iteration tracking
-    current_error_count = len(logs)
-
-    # Build verified_fixes: if a previous reflector suggestion fixed an
-    # error category, record it as a permanent constraint.
-    verified_fixes = list(state.get("verified_fixes") or [])
-    prev_syntax_errors = state.get("_prev_syntax_file_count", 0)
-    current_syntax_errors = len(files_with_errors)
-    if prev_syntax_errors > 0 and current_syntax_errors < prev_syntax_errors:
-        # Syntax errors decreased — the reflector's advice worked.
-        # Extract the fix pattern from the reflection.
-        reflection = state.get("reflection", "")
-        if reflection and "raw" in reflection.lower() and "docstring" in reflection.lower():
-            fix = "Use raw docstrings (r\"\"\"...\"\"\") for any string containing backslashes"
-            if fix not in verified_fixes:
-                verified_fixes.append(fix)
-        if reflection and "signature" in reflection.lower():
-            fix = "Function signatures MUST match what tests expect — check test imports before defining functions"
-            if fix not in verified_fixes:
-                verified_fixes.append(fix)
-
-    # Track best code drafts for this phase (fewest errors)
-    best_drafts = state.get("best_code_drafts") or {}
-    best_count = state.get("best_error_count", -1)
-    if best_count < 0 or current_error_count < best_count:
-        best_drafts = dict(code_drafts)
-        best_count = current_error_count
-
-    # Rollback: if error count has increased for 3+ consecutive iterations,
-    # revert to the best-known code.
-    if (
-        current_error_count > best_count > 0
-        and error_repeat_count == 0  # different error each time (oscillating)
-        and phase_error_count >= 4
-        and phase_error_count % 3 == 0  # every 3 worsening iterations
-    ):
-        logger.warning(
-            "Reverting to best code snapshot (%d errors vs current %d)",
-            best_count, current_error_count,
-        )
-        code_drafts = dict(best_drafts)
-        if output_dir:
-            _write_code_drafts(code_drafts, output_dir)
 
     # Detect collection errors (no tests actually ran)
     log_text = "\n".join(logs) if logs else ""
@@ -1283,14 +1223,9 @@ def verifier(state: ScientificState) -> dict[str, Any]:
         "iteration_count": state.get("iteration_count", 0) + 1,
         "_prev_error_fingerprint": error_fingerprint,
         "_error_repeat_count": error_repeat_count,
-        "_phase_error_count": phase_error_count,
         "_phase_iteration_count": phase_iter_count,
-        "_prev_syntax_file_count": current_syntax_errors,
         "_collection_error": collection_error,
         "clean_files": clean_files,
-        "verified_fixes": verified_fixes,
-        "best_code_drafts": best_drafts,
-        "best_error_count": best_count,
         "code_drafts": code_drafts,
         "transcript": transcript,
     }
@@ -1309,6 +1244,12 @@ def _extract_findings(text: str) -> tuple[str, list[str]]:
 
     Returns ``(analysis_text, findings_list)``.
     """
+    # Strip ## Action section first (if present) before parsing findings
+    action_marker = "## Action"
+    action_idx = text.find(action_marker)
+    if action_idx >= 0:
+        text = text[:action_idx]
+
     marker = "## Key Findings"
     idx = text.find(marker)
     if idx < 0:
@@ -1327,6 +1268,23 @@ def _extract_findings(text: str) -> tuple[str, list[str]]:
             findings.append(line)
 
     return analysis, findings
+
+
+def _extract_action(text: str) -> str:
+    """Parse the ``## Action`` recommendation from a reflector response.
+
+    Returns ``"replan"`` or ``"retry"`` (default).
+    """
+    marker = "## Action"
+    idx = text.find(marker)
+    if idx < 0:
+        return "retry"
+    raw = text[idx + len(marker):].strip().splitlines()
+    if raw:
+        first = raw[0].strip().upper()
+        if "REPLAN" in first:
+            return "replan"
+    return "retry"
 
 
 def reflector(state: ScientificState) -> dict[str, Any]:
@@ -1383,8 +1341,10 @@ def reflector(state: ScientificState) -> dict[str, Any]:
         HumanMessage(content=reflector_user_msg),
     ])
 
-    # Single-call: parse analysis and key findings from the response.
-    reflection, new_raw_findings = _extract_findings(response.content)
+    # Single-call: parse analysis, key findings, and action from the response.
+    full_response = response.content
+    reflection, new_raw_findings = _extract_findings(full_response)
+    action = _extract_action(full_response)
 
     # Deduplicate against existing ground_truth
     existing = list(state.get("ground_truth", []))
@@ -1411,6 +1371,7 @@ def reflector(state: ScientificState) -> dict[str, Any]:
     return {
         "reflection": reflection,
         "ground_truth": existing,
+        "_reflector_action": action,
         "_prompt_summary": reflector_user_msg,
         "transcript": transcript,
     }
