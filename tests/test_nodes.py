@@ -14,6 +14,7 @@ from orchestrator.nodes import (
     _ensure_importable,
     _extract_action,
     _extract_findings,
+    _format_code_listing,
     _llm_triage,
     _pick_replan_phase,
     _extract_signatures,
@@ -1285,6 +1286,44 @@ class TestExtractAction:
     def test_empty_action_section_defaults_to_retry(self) -> None:
         text = "Analysis.\n\n## Action\n"
         assert _extract_action(text) == "retry"
+
+
+# ---------------------------------------------------------------------------
+# _format_code_listing
+# ---------------------------------------------------------------------------
+
+class TestFormatCodeListing:
+    """_format_code_listing formats code_drafts as fenced Markdown blocks."""
+
+    def test_basic_listing(self) -> None:
+        drafts = {"a.py": "x = 1\n", "b.py": "y = 2\n"}
+        result = _format_code_listing(drafts)
+        assert len(result) == 2
+        assert "### a.py" in result[0]
+        assert "x = 1" in result[0]
+        assert "```python" in result[0]
+
+    def test_skips_non_python(self) -> None:
+        drafts = {"a.py": "x = 1\n", "readme.md": "# Hello\n"}
+        result = _format_code_listing(drafts)
+        assert len(result) == 1
+
+    def test_clean_files_annotated(self) -> None:
+        drafts = {"a.py": "x = 1\n", "b.py": "y = 2\n"}
+        result = _format_code_listing(drafts, clean_files={"a.py"})
+        assert "✅" in result[0]
+        assert "✅" not in result[1]
+
+    def test_only_failing_skips_clean(self) -> None:
+        drafts = {"a.py": "x = 1\n", "b.py": "y = 2\n"}
+        result = _format_code_listing(
+            drafts, clean_files={"a.py"}, only_failing=True,
+        )
+        assert len(result) == 1
+        assert "b.py" in result[0]
+
+    def test_empty_drafts(self) -> None:
+        assert _format_code_listing({}) == []
 
 
 # ---------------------------------------------------------------------------

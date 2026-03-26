@@ -425,6 +425,48 @@ def advance_phase(state: ScientificState) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Shared prompt helpers
+# ---------------------------------------------------------------------------
+
+
+def _format_code_listing(
+    code_drafts: dict[str, str],
+    *,
+    clean_files: set[str] | None = None,
+    only_failing: bool = False,
+) -> list[str]:
+    """Format code_drafts as fenced Markdown blocks for LLM prompts.
+
+    Parameters
+    ----------
+    code_drafts : dict
+        Mapping of file paths to source code.
+    clean_files : set or None
+        If given, clean files are annotated with a ✅ marker.
+    only_failing : bool
+        If True, skip files present in *clean_files*.
+
+    Returns a list of formatted sections (one per .py file).
+    """
+    sections: list[str] = []
+    clean = clean_files or set()
+    for fpath in sorted(code_drafts):
+        if not fpath.endswith(".py"):
+            continue
+        if only_failing and fpath in clean:
+            continue
+        source = code_drafts[fpath]
+        if clean_files is not None and fpath in clean:
+            sections.append(
+                f"### {fpath} ✅ (NO ERRORS — do NOT modify)\n"
+                f"```python\n{source}\n```"
+            )
+        else:
+            sections.append(f"### {fpath}\n```python\n{source}\n```")
+    return sections
+
+
+# ---------------------------------------------------------------------------
 # 2. Coder
 # ---------------------------------------------------------------------------
 
@@ -580,18 +622,9 @@ def coder(state: ScientificState) -> dict[str, Any]:
             # Full source context for revisions — the coder needs to see
             # its own code to fix specific lines.
             clean = set(state.get("clean_files") or [])
-            source_parts: list[str] = []
-            for fpath in sorted(existing_drafts.keys()):
-                if fpath in clean:
-                    source_parts.append(
-                        f"### {fpath} ✅ (NO ERRORS — do NOT modify)\n"
-                        f"```python\n{existing_drafts[fpath]}\n```"
-                    )
-                else:
-                    source_parts.append(
-                        f"### {fpath}\n"
-                        f"```python\n{existing_drafts[fpath]}\n```"
-                    )
+            source_parts = _format_code_listing(
+                existing_drafts, clean_files=clean,
+            )
             user_parts.append(
                 "## Your current source files\n"
                 "Files marked ✅ have no errors — do NOT regenerate them.\n"
@@ -1009,11 +1042,7 @@ def _llm_triage(code_drafts: dict[str, str], llm: Any) -> list[str]:
     prompt = _load_prompt("EXPLORER_PROMPT_TRIAGE", "triage.md")
 
     # Build a concise code listing for the LLM
-    sections: list[str] = []
-    for fpath in sorted(code_drafts):
-        if not fpath.endswith(".py"):
-            continue
-        sections.append(f"### {fpath}\n```python\n{code_drafts[fpath]}\n```")
+    sections = _format_code_listing(code_drafts)
 
     if not sections:
         return []
@@ -1302,11 +1331,10 @@ def reflector(state: ScientificState) -> dict[str, Any]:
 
     # Include failing source code so the reflector can see what went wrong
     code_drafts: dict[str, str] = state.get("code_drafts", {})
-    clean_files: list[str] = state.get("clean_files") or []
-    failing_sources: list[str] = []
-    for fpath, source in sorted(code_drafts.items()):
-        if fpath.endswith(".py") and fpath not in clean_files:
-            failing_sources.append(f"### {fpath}\n```python\n{source}\n```")
+    clean = set(state.get("clean_files") or [])
+    failing_sources = _format_code_listing(
+        code_drafts, only_failing=True, clean_files=clean,
+    )
 
     source_section = ""
     if failing_sources:

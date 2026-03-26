@@ -596,3 +596,14 @@ Four fixes re-applied on top of `7a8565d` ("update for larger LLMs"), addressing
 - cli.py: Removed 2 constants, simplified 2 routing functions
 - nodes.py: Removed ~50 lines of heuristic code, added ~15 lines for `_extract_action`
 - Tests: 199 → 196 (removed 13 counter-based tests, added 10 LLM-routing tests)
+
+## Phase 5: Compress Prompt Assembly
+
+- **Problem:** Three nodes (coder, triage, reflector) each had inline loops to format `code_drafts` as fenced Markdown code blocks. The formatting logic was duplicated with minor variations (clean-file marks, failing-only filter).
+- **Fix:** Extracted a shared `_format_code_listing()` helper that handles all three use cases via keyword arguments (`clean_files`, `only_failing`). Each call site reduced from 5–12 lines to 2–3 lines.
+- **New helper:** `_format_code_listing(code_drafts, *, clean_files=None, only_failing=False) -> list[str]` — filters to `.py` files, optionally annotates clean files with ✅, optionally skips clean files.
+- **Assessment:** The remaining "duplicated" patterns (run-history injection, skills-context injection, SystemMessage/HumanMessage invocation) are each 2–3 lines and don't benefit from further abstraction — extracting them would add indirection without reducing complexity.
+
+### Impact
+- nodes.py: 1377 → ~1370 lines (small net reduction — gained helper, simplified 3 call sites)
+- Tests: 196 → 201 (5 new `_format_code_listing` tests)
