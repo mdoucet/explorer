@@ -90,6 +90,7 @@ class ScientificState(TypedDict, total=False):
     best_error_count: int
     _prev_syntax_file_count: int
     _collection_error: bool
+    transcript: list[dict]
 
 
 def make_checkpointer(db_path: str = "checkpoints.sqlite") -> SqliteSaver:

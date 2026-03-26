@@ -21,6 +21,7 @@ from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
 
 from .state import ScientificState
+from .transcript import format_history, make_entry
 
 logger = logging.getLogger(__name__)
 
@@ -279,6 +280,11 @@ def planner(state: ScientificState) -> dict[str, Any]:
             f"## Constants\n{state['mathematical_constants']}"
         )
 
+    # Inject run history so the planner sees what happened before
+    history = format_history(state.get("transcript") or [])
+    if history:
+        user_parts.append(history)
+
     if is_replan:
         phases = state["plan_phases"]
         current = state.get("current_phase", 0)
@@ -292,12 +298,8 @@ def planner(state: ScientificState) -> dict[str, Any]:
             f"remain \"{original_title}\". Do NOT change it back to scaffolding "
             f"or reduce the scope.  Suggest a DIFFERENT implementation "
             f"approach for the same deliverables.\n\n"
-            f"**Current phase description:**\n{phase['description']}\n\n"
-            f"**Error analysis from reflector:**\n{state['reflection']}"
+            f"**Current phase description:**\n{phase['description']}"
         )
-        if state.get("test_logs"):
-            log_text = "\n---\n".join(state["test_logs"])
-            user_parts.append(f"## Failing test output\n```\n{log_text}\n```")
 
     if state.get("skills_context"):
         user_parts.append(state["skills_context"])
@@ -333,12 +335,19 @@ def planner(state: ScientificState) -> dict[str, Any]:
                 phases[current]["files"] = best["files"]
         plan_text = phases[current]["description"]
         _write_plan_artifact(phases, current)
+        transcript = list(state.get("transcript") or [])
+        transcript.append(make_entry(
+            "ai", f"Revised plan for Phase {current + 1}:\n{plan_text}",
+            node="planner", step=state.get("iteration_count", 0), phase=current,
+            summary=f"Replanned Phase {current + 1}: {original_title}",
+        ))
         return {
             "plan": plan_text,
             "plan_phases": phases,
             "_prompt_summary": user_message,
             "_error_repeat_count": 0,  # reset after replan
             "_replan_count": state.get("_replan_count", 0) + 1,
+            "transcript": transcript,
         }
 
     plan_phases = _parse_plan_phases(raw_plan)
@@ -349,11 +358,19 @@ def planner(state: ScientificState) -> dict[str, Any]:
 
     _write_plan_artifact(plan_phases, current_phase)
 
+    transcript = list(state.get("transcript") or [])
+    phase_titles = [p["title"] for p in plan_phases]
+    transcript.append(make_entry(
+        "ai", raw_plan,
+        node="planner", step=0, phase=0,
+        summary=f"Plan: {len(plan_phases)} phases — {', '.join(phase_titles)}",
+    ))
     return {
         "plan": plan_text,
         "plan_phases": plan_phases,
         "current_phase": current_phase,
         "_prompt_summary": user_message,
+        "transcript": transcript,
     }
 
 
@@ -380,6 +397,17 @@ def advance_phase(state: ScientificState) -> dict[str, Any]:
 
     _write_plan_artifact(phases, next_idx)
 
+    transcript = list(state.get("transcript") or [])
+    prev_title = phases[current]["title"]
+    next_title = phases[next_idx]["title"]
+    transcript.append(make_entry(
+        "human",
+        f"Phase {current + 1} '{prev_title}' completed. "
+        f"Moving to Phase {next_idx + 1}: '{next_title}'.",
+        node="advance_phase",
+        step=state.get("iteration_count", 0), phase=next_idx,
+    ))
+
     return {
         "plan": plan_text,
         "plan_phases": phases,
@@ -397,6 +425,7 @@ def advance_phase(state: ScientificState) -> dict[str, Any]:
         "clean_files": [],
         "best_code_drafts": {},
         "best_error_count": -1,
+        "transcript": transcript,
     }
 
 
@@ -490,6 +519,26 @@ def _get_environment_info() -> str:
     return _env_info_cache
 
 
+def _append_coder_transcript(
+    state: ScientificState,
+    new_drafts: dict[str, str],
+    deletions: set[str],
+) -> list[dict]:
+    """Build updated transcript with coder summary entry."""
+    transcript = list(state.get("transcript") or [])
+    file_list = ", ".join(sorted(new_drafts.keys()))
+    parts = [f"Generated {len(new_drafts)} file(s): {file_list}"]
+    if deletions:
+        parts.append(f"Deleted: {', '.join(sorted(deletions))}")
+    transcript.append(make_entry(
+        "ai", "\n".join(parts),
+        node="coder",
+        step=state.get("iteration_count", 0),
+        phase=state.get("current_phase", 0),
+    ))
+    return transcript
+
+
 def coder(state: ScientificState) -> dict[str, Any]:
     """Generate Python source code from the current plan phase.
 
@@ -518,13 +567,11 @@ def coder(state: ScientificState) -> dict[str, Any]:
     if env_info:
         user_parts.append(f"## Environment\n{env_info}")
 
-    # Inject accumulated ground-truth lessons so the coder avoids
-    # repeating mistakes from prior iterations.
-    gt = state.get("ground_truth") or []
-    if gt:
-        user_parts.append(
-            "## Lessons learned from prior iterations\n" + "\n".join(gt)
-        )
+    # Inject run history so the coder sees what happened in prior iterations
+    # (replaces ad-hoc ground_truth, reflection, test_logs injection).
+    history = format_history(state.get("transcript") or [])
+    if history:
+        user_parts.append(history)
 
     # Inject verified fixes as non-negotiable constraints
     verified_fixes = state.get("verified_fixes") or []
@@ -535,25 +582,8 @@ def coder(state: ScientificState) -> dict[str, Any]:
             f"These rules have been validated.  You MUST follow them:\n{rules}"
         )
 
-    # If we have error context from a previous iteration, show the coder
-    # what went wrong so it can fix its own mistakes directly.
+    # Determine if this is a revision iteration (has prior reflection).
     is_revision = bool(state.get("reflection"))
-    if is_revision:
-        error_repeat = state.get("_error_repeat_count", 0)
-        if error_repeat >= 3:
-            user_parts.append(
-                f"## ⚠️  CRITICAL — same error for {error_repeat} consecutive iterations\n"
-                "Your previous code did NOT fix the problem.  Read the error "
-                "analysis below VERY carefully and make DIFFERENT choices this time."
-            )
-        user_parts.append(
-            f"## Previous error analysis\n{state['reflection']}"
-        )
-    if state.get("test_logs"):
-        log_text = "\n---\n".join(state["test_logs"])
-        user_parts.append(
-            f"## Test failures to fix\n```\n{log_text}\n```"
-        )
 
     # Inform coder about files that already exist from prior phases.
     # On revision iterations, show FULL source so the coder can see
@@ -658,7 +688,12 @@ def coder(state: ScientificState) -> dict[str, Any]:
                 logger.warning("Removing file from disk: %s", fp)
                 target.unlink()
 
-    return {"code_drafts": merged_drafts, "coder_raw_response": raw_content, "_prompt_summary": user_message}
+    return {
+        "code_drafts": merged_drafts,
+        "coder_raw_response": raw_content,
+        "_prompt_summary": user_message,
+        "transcript": _append_coder_transcript(state, new_drafts, deletions),
+    }
 
 
 _FILE_EXTENSIONS = frozenset({
@@ -1330,10 +1365,18 @@ def verifier(state: ScientificState) -> dict[str, Any]:
     """
     code_drafts: dict[str, str] = state.get("code_drafts", {})
     if not code_drafts:
+        transcript = list(state.get("transcript") or [])
+        transcript.append(make_entry(
+            "human", "No code drafts to verify.",
+            node="verifier",
+            step=state.get("iteration_count", 0) + 1,
+            phase=state.get("current_phase", 0),
+        ))
         return {
             "test_logs": ["No code drafts to verify."],
             "iteration_count": state.get("iteration_count", 0) + 1,
             "_phase_iteration_count": state.get("_phase_iteration_count", 0) + 1,
+            "transcript": transcript,
         }
 
     # Quick structural and import checks before running pytest
@@ -1447,6 +1490,23 @@ def verifier(state: ScientificState) -> dict[str, Any]:
         or "Interrupted: " in log_text and "error during collection" in log_text
     )
 
+    transcript = list(state.get("transcript") or [])
+    if logs:
+        transcript.append(make_entry(
+            "human", f"Tests FAILED:\n```\n{log_text[:3000]}\n```",
+            node="verifier",
+            step=state.get("iteration_count", 0) + 1,
+            phase=state.get("current_phase", 0),
+        ))
+    else:
+        transcript.append(make_entry(
+            "human", "All tests passed \u2713",
+            node="verifier",
+            step=state.get("iteration_count", 0) + 1,
+            phase=state.get("current_phase", 0),
+            summary="Tests: All passed \u2713",
+        ))
+
     return {
         "test_logs": logs,
         "iteration_count": state.get("iteration_count", 0) + 1,
@@ -1461,6 +1521,7 @@ def verifier(state: ScientificState) -> dict[str, Any]:
         "best_code_drafts": best_drafts,
         "best_error_count": best_count,
         "code_drafts": code_drafts,
+        "transcript": transcript,
     }
 
 
@@ -1493,6 +1554,13 @@ def reflector(state: ScientificState) -> dict[str, Any]:
         )
 
     reflector_parts: list[str] = []
+
+    # Inject run history so the reflector sees what was tried before
+    # (replaces ad-hoc ground_truth, prior_reflection injection).
+    history = format_history(state.get("transcript") or [])
+    if history:
+        reflector_parts.append(history)
+
     reflector_parts.append(f"## Test logs\n```\n{log_text}\n```")
     if source_section:
         reflector_parts.append(source_section)
@@ -1504,22 +1572,6 @@ def reflector(state: ScientificState) -> dict[str, Any]:
         "If a test calls `f(V0=50)` but the function uses `depth`, change "
         "the function parameter name to `V0`, NOT the test."
     )
-
-    # Include accumulated lessons so the reflector avoids re-suggesting
-    # approaches that already failed.
-    gt = state.get("ground_truth") or []
-    if gt:
-        reflector_parts.append(
-            "## Known lessons (do NOT re-suggest these)\n" + "\n".join(gt)
-        )
-
-    # Include prior reflection so the reflector knows what was already tried.
-    prev_reflection = state.get("reflection", "")
-    if prev_reflection:
-        reflector_parts.append(
-            "## Previous reflection (this approach did NOT work)\n"
-            + prev_reflection
-        )
 
     reflector_user_msg = "\n\n".join(reflector_parts)
     response = _invoke_llm(llm, [
@@ -1550,4 +1602,23 @@ def reflector(state: ScientificState) -> dict[str, Any]:
                 existing.append(line)
                 seen.add(line)
 
-    return {"reflection": reflection, "ground_truth": existing, "_prompt_summary": reflector_user_msg}
+    # Build transcript entry with analysis and any new findings
+    original_gt = set(state.get("ground_truth") or [])
+    new_findings = [f for f in existing if f not in original_gt]
+    transcript_content = reflection
+    if new_findings:
+        transcript_content += "\n\n## Key findings\n" + "\n".join(new_findings)
+    transcript = list(state.get("transcript") or [])
+    transcript.append(make_entry(
+        "ai", transcript_content,
+        node="reflector",
+        step=state.get("iteration_count", 0),
+        phase=state.get("current_phase", 0),
+        summary=f"Analysis: {reflection.split(chr(10), 1)[0][:150]}",
+    ))
+    return {
+        "reflection": reflection,
+        "ground_truth": existing,
+        "_prompt_summary": reflector_user_msg,
+        "transcript": transcript,
+    }

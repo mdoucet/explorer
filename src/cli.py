@@ -406,6 +406,7 @@ def run(task: str | None, task_file: str | None, thread_id: str, db: str,
             "skills_context": skills_context,
             "plan_phases": [],
             "current_phase": 0,
+            "transcript": [],
         }
 
     # Set up reporting

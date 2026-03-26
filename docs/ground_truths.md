@@ -479,3 +479,41 @@ Four fixes re-applied on top of `7a8565d` ("update for larger LLMs"), addressing
 
 ### Test Impact
 - 8 new tests: `TestShouldContinue` (6 tests), `TestAfterReflector` force-replan (2 tests). Total: 188 tests passing (1 skipped).
+
+## Phase 1 Refactor: Conversation Transcript (Context Foundation)
+
+- **Problem observed:** Each LLM call in the Scientific Loop was stateless — a fresh `[SystemMessage, HumanMessage]` pair with no memory of prior iterations. Context was assembled ad-hoc: the coder manually injected `ground_truth`, `reflection`, `test_logs`, and an `_error_repeat_count` CRITICAL warning as separate conditional sections. The reflector similarly injected `ground_truth` and `prev_reflection`. The planner (replan) injected `reflection` and `test_logs`. Each node had its own hand-crafted prompt assembly logic.
+- **Root cause (amnesia):** With no structured run history, the LLM on iteration 5 had limited awareness of iterations 1–4. Information was compressed through state fields (`reflection` = latest analysis only, `ground_truth` = deduplicated findings), losing the narrative of what was tried, what failed, and why.
+
+### New module: `src/orchestrator/transcript.py`
+- **`make_entry(role, content, *, node, step, phase, summary)`** — Creates a structured transcript entry. Role is `"human"` (environment: verifier, advance_phase) or `"ai"` (agent: planner, coder, reflector). Summary defaults to first 200 chars of first line.
+- **`format_history(transcript, max_recent=8)`** — Formats the transcript as a `## Run History` section. Recent entries (last 8) are shown in full. Older entries are condensed to one-line summaries with `[step N, node]` prefix. Returns empty string for empty transcript.
+
+### State change: `transcript: list[dict]` added to `ScientificState`
+- Initialized as `[]` in `cli.py`
+- Persisted across phases (NOT cleared on `advance_phase`)
+- Each node appends entries and returns the updated transcript
+
+### Node wiring (all 5 nodes append to transcript):
+- **Planner (initial):** AI entry with full plan text, summary = "Plan: N phases — title1, title2"
+- **Planner (replan):** AI entry with revised plan, summary = "Replanned Phase N: title"
+- **Coder:** AI entry with file list summary ("Generated N file(s): file1, file2"), not full source
+- **Verifier (pass):** Human entry "All tests passed ✓"
+- **Verifier (fail):** Human entry with test output (truncated to 3000 chars)
+- **Reflector:** AI entry with analysis + any new key findings
+- **Advance Phase:** Human entry "Phase N 'title' completed. Moving to Phase N+1: 'title'"
+
+### Context replacement (nodes READ from transcript):
+- **Coder:** `format_history()` replaces 4 ad-hoc injections: `ground_truth`, `reflection`, `test_logs`, and `_error_repeat_count` CRITICAL warning. Keeps: phase context, environment info, verified_fixes, existing file source, skills.
+- **Reflector:** `format_history()` replaces `ground_truth` and `prev_reflection` injections. Keeps: current test logs, failing source code, anti-test-change directive.
+- **Planner (replan):** `format_history()` replaces inline `reflection` and `test_logs` in the replan section. Keeps: task, phase description, skills.
+
+### Key design decisions:
+- Transcript is formatted as a narrative section in the HumanMessage (not multi-turn chat). This avoids message alternation issues across different LLM providers.
+- Each node still uses its own system prompt. The transcript provides history; the current message provides structured data (code, environment, skills).
+- Windowing: recent 8 entries shown in full, older entries condensed to summaries. This prevents prompt bloat on long runs while preserving recent context.
+
+### Test Impact
+- 17 new tests in `tests/test_transcript.py` (5 `TestMakeEntry`, 7 `TestFormatHistory`, 5 `TestTranscriptIntegration`)
+- 7 existing tests updated to provide transcript entries instead of direct state field assertions
+- Total: 205 tests passing (1 skipped).

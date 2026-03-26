@@ -34,6 +34,7 @@ from orchestrator.nodes import (
     verifier,
 )
 from orchestrator.state import ScientificState
+from orchestrator.transcript import make_entry
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +83,17 @@ class TestPlanner:
 
         assert "plan" in result
         assert "Plan" in result["plan"]
+
+    def test_appends_to_transcript(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = _FakeLLM("## Phase 1: Core\nBuild it.\nFiles: core.py\n")
+        monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
+
+        state = _base_state()
+        result = planner(state)
+
+        assert len(result["transcript"]) == 1
+        assert result["transcript"][0]["node"] == "planner"
+        assert result["transcript"][0]["role"] == "ai"
 
     def test_includes_reflection_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = _FakeLLM("revised plan")
@@ -304,6 +316,10 @@ class TestVerifier:
         result = verifier(state)
         assert result["test_logs"] == []
         assert result["iteration_count"] == 1
+        # Verifier should append to transcript
+        assert len(result["transcript"]) == 1
+        assert result["transcript"][0]["node"] == "verifier"
+        assert "passed" in result["transcript"][0]["content"].lower()
 
     def test_passing_code_src_layout(self) -> None:
         """src/ layout: package under src/, tests import from package name."""
@@ -475,34 +491,45 @@ class TestReflectorContext:
         assert "NEVER suggest changing test" in prompt
         assert "fix the implementation" in prompt.lower()
 
-    def test_includes_ground_truth(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_includes_ground_truth(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = _FakeLLM("Try a different approach.")
         monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
 
         state = _base_state(
             test_logs=["FAILED test - assert 0 == 1"],
-            ground_truth=["- brentq needs bracket endpoints with opposite signs"],
+            transcript=[
+                make_entry(
+                    "ai",
+                    "Analysis: brentq needs bracket endpoints with opposite signs",
+                    node="reflector", step=1, phase=0,
+                ),
+            ],
         )
         result = reflector(state)
         prompt = result["_prompt_summary"]
-        assert "Known lessons" in prompt
+        assert "Run History" in prompt
         assert "brentq needs bracket" in prompt
+        # Transcript should grow by 1 (reflector appended its entry)
+        assert len(result["transcript"]) == 2
+        assert result["transcript"][-1]["node"] == "reflector"
 
-    def test_includes_prior_reflection(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_includes_prior_reflection(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = _FakeLLM("Different root cause found.")
         monkeypatch.setattr("orchestrator.nodes.get_llm", lambda: fake)
 
         state = _base_state(
             test_logs=["FAILED test - assert 0 == 1"],
-            reflection="Previous suggestion: use finer grid. Did not work.",
+            transcript=[
+                make_entry(
+                    "ai",
+                    "Previous suggestion: use finer grid. Did not work.",
+                    node="reflector", step=1, phase=0,
+                ),
+            ],
         )
         result = reflector(state)
         prompt = result["_prompt_summary"]
-        assert "Previous reflection" in prompt
+        assert "Run History" in prompt
         assert "finer grid" in prompt
 
 
@@ -522,12 +549,21 @@ class TestCoderGroundTruthContext:
 
         state = _base_state(
             plan="Implement the solver",
-            ground_truth=["- Use brentq not bisect for root finding"],
+            transcript=[
+                make_entry(
+                    "ai",
+                    "Use brentq not bisect for root finding",
+                    node="reflector", step=1, phase=0,
+                ),
+            ],
         )
         result = coder(state)
         prompt = result["_prompt_summary"]
-        assert "Lessons learned" in prompt
+        assert "Run History" in prompt
         assert "brentq not bisect" in prompt
+        # Transcript should grow by 1 (coder appended its entry)
+        assert len(result["transcript"]) == 2
+        assert result["transcript"][-1]["node"] == "coder"
 
     def test_no_ground_truth_section_when_empty(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -538,7 +574,7 @@ class TestCoderGroundTruthContext:
         state = _base_state(plan="Implement the solver")
         result = coder(state)
         prompt = result["_prompt_summary"]
-        assert "Lessons learned" not in prompt
+        assert "Run History" not in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -1198,11 +1234,17 @@ class TestCoderErrorContext:
         state = _base_state(
             plan="implement constants",
             reflection="Define HBAR at module level, not inside get_constants().",
+            transcript=[
+                make_entry(
+                    "ai",
+                    "Define HBAR at module level, not inside get_constants().",
+                    node="reflector", step=1, phase=0,
+                ),
+            ],
         )
         result = coder(state)
 
         prompt_sent = result["_prompt_summary"]
-        assert "Previous error analysis" in prompt_sent
         assert "HBAR" in prompt_sent
 
     def test_includes_test_logs_in_prompt(
@@ -1214,12 +1256,17 @@ class TestCoderErrorContext:
 
         state = _base_state(
             plan="fix imports",
-            test_logs=["Import mismatch: tests/test_c.py imports 'HBAR'"],
+            transcript=[
+                make_entry(
+                    "human",
+                    "Tests FAILED:\n```\nImport mismatch: tests/test_c.py imports 'HBAR'\n```",
+                    node="verifier", step=1, phase=0,
+                ),
+            ],
         )
         result = coder(state)
 
         prompt_sent = result["_prompt_summary"]
-        assert "Test failures to fix" in prompt_sent
         assert "Import mismatch" in prompt_sent
 
     def test_no_error_context_on_first_iteration(
@@ -1247,12 +1294,25 @@ class TestCoderErrorContext:
             plan="fix imports",
             reflection="Constants must be at module level.",
             _error_repeat_count=4,
+            transcript=[
+                make_entry("human", "Tests FAILED:\n```\nNameError: HBAR not defined\n```",
+                           node="verifier", step=1, phase=0),
+                make_entry("ai", "Constants must be at module level.",
+                           node="reflector", step=1, phase=0),
+                make_entry("ai", "Generated 1 file(s): solver.py",
+                           node="coder", step=1, phase=0),
+                make_entry("human", "Tests FAILED:\n```\nNameError: HBAR not defined\n```",
+                           node="verifier", step=2, phase=0),
+                make_entry("ai", "Constants must be at module level.",
+                           node="reflector", step=2, phase=0),
+            ],
         )
         result = coder(state)
 
         prompt_sent = result["_prompt_summary"]
-        assert "CRITICAL" in prompt_sent
-        assert "4 consecutive iterations" in prompt_sent
+        # Repeated failure pattern is visible in the run history
+        assert "Run History" in prompt_sent
+        assert "NameError" in prompt_sent
 
     def test_revision_protects_clean_test_files(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -1838,10 +1898,16 @@ class TestPlannerReplan:
             current_phase=0,
             reflection="Off-by-one in bracket computation.",
             test_logs=["FAILED test_solver - assert 1.73 != 1.71"],
+            transcript=[
+                make_entry("human", "Tests FAILED:\n```\nFAILED test_solver - assert 1.73 != 1.71\n```",
+                           node="verifier", step=1, phase=0),
+                make_entry("ai", "Off-by-one in bracket computation.",
+                           node="reflector", step=1, phase=0),
+            ],
         )
         result = planner(state)
 
-        # The prompt should contain the error analysis and test logs
+        # The prompt should contain the error analysis and test logs via transcript
         assert "REPLAN REQUEST" in result["_prompt_summary"]
         assert "Off-by-one" in result["_prompt_summary"]
         assert "assert 1.73 != 1.71" in result["_prompt_summary"]
