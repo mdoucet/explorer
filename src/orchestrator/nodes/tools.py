@@ -15,7 +15,7 @@ from pathlib import Path
 
 from langchain_core.tools import tool as langchain_tool
 
-from ._verifier import _ensure_importable, _run_pytest
+from .verifier import _ensure_importable, _run_pytest
 
 logger = logging.getLogger(__name__)
 

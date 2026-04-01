@@ -15,8 +15,8 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from . import _shared
-from ._shared import (
+from . import shared
+from .shared import (
     _format_code_listing,
     _invoke_llm,
     _load_prompt,
@@ -58,6 +58,73 @@ def _run_pytest(root: Path, extra_env: dict[str, str] | None = None) -> list[str
     return []
 
 
+# Directories that must never be traversed when scanning for __init__.py.
+# Recursing into .venv would add installed-package site-packages to sys.path,
+# poisoning imports with potentially broken or duplicate packages.
+_SKIP_DIRS = frozenset({
+    ".venv", "venv", ".env", "env",
+    "node_modules", ".git", ".tox", ".nox", "__pycache__",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache",
+})
+
+
+def _pip_editable_install(root: Path) -> bool:
+    """Try ``pip install -e .`` in *root*, return *True* on success.
+
+    First attempts with ``--no-build-isolation`` (fast path).  If that
+    fails — e.g. because the build backend is not installed — retries
+    *with* build isolation so pip can fetch the backend itself.
+    """
+    for extra_flags in (["--no-build-isolation"], []):
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-m", "pip", "install", "-e", str(root),
+             *extra_flags, "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(root),
+        )
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def _collect_path_roots(root: Path) -> set[str]:
+    """Collect directories that should be on ``sys.path`` for imports.
+
+    Walks *root* looking for ``__init__.py`` files while skipping
+    infrastructure directories (``.venv``, ``node_modules``, …) to
+    avoid adding installed-package site-packages to the path.
+    """
+    path_roots: set[str] = set()
+    path_roots.add(str(root))
+    if (root / "src").is_dir():
+        path_roots.add(str(root / "src"))
+
+    for init in root.rglob("__init__.py"):
+        # Skip infrastructure directories.
+        if _SKIP_DIRS.intersection(init.relative_to(root).parts):
+            continue
+        pkg_dir = init.parent
+        while (pkg_dir.parent / "__init__.py").exists():
+            pkg_dir = pkg_dir.parent
+        path_roots.add(str(pkg_dir.parent))
+
+    return path_roots
+
+
+def _write_conftest(root: Path, path_roots: set[str]) -> None:
+    """Write a ``conftest.py`` that inserts *path_roots* into ``sys.path``."""
+    path_lines = "\n".join(
+        f'    sys.path.insert(0, {p!r})' for p in sorted(path_roots)
+    )
+    (root / "conftest.py").write_text(
+        "import sys\n\n\n"
+        "def pytest_configure(config):\n"
+        f"{path_lines}\n"
+    )
+
+
 def _prepare_sandbox(root: Path, code_drafts: dict[str, str]) -> None:
     """Write *code_drafts* into *root* and make imports work.
 
@@ -76,43 +143,14 @@ def _prepare_sandbox(root: Path, code_drafts: dict[str, str]) -> None:
 
     # Attempt editable install if pyproject.toml is present
     if (root / "pyproject.toml").exists():
-        pip_result = subprocess.run(  # noqa: S603
-            [sys.executable, "-m", "pip", "install", "-e", str(root),
-             "--no-build-isolation", "--quiet"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=str(root),
-        )
-        if pip_result.returncode == 0:
+        if _pip_editable_install(root):
             return  # install succeeded — imports will work
 
     # Fallback: generate a conftest that sets up sys.path
     if (root / "conftest.py").exists():
         return  # don't overwrite coder-generated conftest
 
-    # Collect directories that look like Python packages (contain __init__.py)
-    # and their parent directories.
-    path_roots: set[str] = set()
-    path_roots.add(str(root))  # always include the project root
-    if (root / "src").is_dir():
-        path_roots.add(str(root / "src"))
-    for init in root.rglob("__init__.py"):
-        # Add the parent of the top-level package directory
-        pkg_dir = init.parent
-        # Walk up to find the top-level package root
-        while (pkg_dir.parent / "__init__.py").exists():
-            pkg_dir = pkg_dir.parent
-        path_roots.add(str(pkg_dir.parent))
-
-    path_lines = "\n".join(
-        f'    sys.path.insert(0, {p!r})' for p in sorted(path_roots)
-    )
-    (root / "conftest.py").write_text(
-        "import sys\n\n\n"
-        "def pytest_configure(config):\n"
-        f"{path_lines}\n"
-    )
+    _write_conftest(root, _collect_path_roots(root))
 
 
 def _ensure_importable(root: Path, code_drafts: dict[str, str]) -> None:
@@ -124,39 +162,14 @@ def _ensure_importable(root: Path, code_drafts: dict[str, str]) -> None:
     2. Otherwise generate a ``conftest.py`` with ``sys.path`` entries.
     """
     if (root / "pyproject.toml").exists():
-        pip_result = subprocess.run(  # noqa: S603
-            [sys.executable, "-m", "pip", "install", "-e", str(root),
-             "--no-build-isolation", "--quiet"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=str(root),
-        )
-        if pip_result.returncode == 0:
+        if _pip_editable_install(root):
             return
 
     # Fallback: conftest-based sys.path manipulation
     if (root / "conftest.py").exists():
         return
 
-    path_roots: set[str] = set()
-    path_roots.add(str(root))
-    if (root / "src").is_dir():
-        path_roots.add(str(root / "src"))
-    for init in root.rglob("__init__.py"):
-        pkg_dir = init.parent
-        while (pkg_dir.parent / "__init__.py").exists():
-            pkg_dir = pkg_dir.parent
-        path_roots.add(str(pkg_dir.parent))
-
-    path_lines = "\n".join(
-        f'    sys.path.insert(0, {p!r})' for p in sorted(path_roots)
-    )
-    (root / "conftest.py").write_text(
-        "import sys\n\n\n"
-        "def pytest_configure(config):\n"
-        f"{path_lines}\n"
-    )
+    _write_conftest(root, _collect_path_roots(root))
 
 
 # Packages that must never be shadowed by coder-generated directories.
@@ -382,6 +395,8 @@ def verifier(state: ScientificState) -> dict[str, Any]:
             node="verifier",
             step=state.get("iteration_count", 0) + 1,
             phase=state.get("current_phase", 0),
+            metadata={"type": "test_result", "passed": False, "collection_error": True,
+                      "error_fingerprint": "", "error_repeat_count": 0},
         ))
         return {
             "test_logs": ["No code drafts to verify."],
@@ -402,7 +417,7 @@ def verifier(state: ScientificState) -> dict[str, Any]:
         #  _check_cross_module_contracts).
         # Skipped in tool-calling mode — the coder's inner tool loop
         # already catches structural issues.
-        llm = _shared.get_llm()
+        llm = shared.get_llm()
         pre_errors, triage_record = _llm_triage(code_drafts, llm)
         if triage_record:
             llm_calls.append(triage_record)
@@ -468,6 +483,10 @@ def verifier(state: ScientificState) -> dict[str, Any]:
             node="verifier",
             step=state.get("iteration_count", 0) + 1,
             phase=state.get("current_phase", 0),
+            metadata={"type": "test_result", "passed": False,
+                      "collection_error": collection_error,
+                      "error_fingerprint": error_fingerprint,
+                      "error_repeat_count": error_repeat_count},
         ))
     else:
         transcript.append(make_entry(
@@ -476,6 +495,9 @@ def verifier(state: ScientificState) -> dict[str, Any]:
             step=state.get("iteration_count", 0) + 1,
             phase=state.get("current_phase", 0),
             summary="Tests: All passed \u2713",
+            metadata={"type": "test_result", "passed": True,
+                      "collection_error": False,
+                      "error_fingerprint": "", "error_repeat_count": 0},
         ))
 
     return {

@@ -642,3 +642,40 @@ Four fixes re-applied on top of `7a8565d` ("update for larger LLMs"), addressing
 1. **`prompts/planner_direct.md`** — Added "Emergent quantities" rule: don't hardcode solver-derived counts. Use property-based assertions and lower bounds. Re-derive exact counts after implementation.
 2. **`prompts/planner.md`** — Same rule for scaffold mode.
 3. **`skills/quantum-mechanics/SKILL.md`** — Added "Counting bound states" section with correct formula `ceil(2C/π)`, explicit warning against `floor(C/π)*2`, and good/bad test patterns.
+
+## Node Module Rename: Underscore Prefix Removed (April 2025)
+
+- **What changed:** All 6 node module files under `src/orchestrator/nodes/` had their leading underscore removed: `_coder.py` → `coder.py`, `_planner.py` → `planner.py`, `_verifier.py` → `verifier.py`, `_reflector.py` → `reflector.py`, `_shared.py` → `shared.py`, `_tools.py` → `tools.py`.
+- **Why:** The underscore convention served no purpose — all symbols were re-exported via `__init__.py`. The user preferred cleaner names.
+- **Naming collision:** When `__init__.py` does `from .coder import coder`, the package attribute `orchestrator.nodes.coder` becomes the *function*, not the *module*. Tests using `import orchestrator.nodes.coder as mod` or string-based `monkeypatch.setattr("orchestrator.nodes.coder.func", ...)` were affected.
+- **Fix:** Tests that need the module object use `importlib.import_module("orchestrator.nodes.coder")` instead of `import orchestrator.nodes.coder`.
+- **Test count:** 295 tests passing after rename, 0 regressions.
+
+## Structured Transcript Metadata & Diff Tracking (April 2025)
+
+- **What changed:** `make_entry()` now accepts an optional `metadata: dict` parameter. Each node populates it with structured data:
+  - **Planner:** `{"type": "plan", "phases": [...], "is_replan": bool}`
+  - **Coder:** `{"type": "code_change", "files_added": [...], "files_deleted": [...], "files_modified": [...], "diff_summary": "..."}`
+  - **Verifier:** `{"type": "test_result", "passed": bool, "collection_error": bool, "error_fingerprint": "...", "error_repeat_count": int}`
+  - **Reflector/Auto-reflect:** `{"type": "analysis", "action": "retry"|"replan", "new_findings": [...]}`
+  - **Advance_phase:** `{"type": "phase_advance", "from_phase": int, "to_phase": int}`
+- **Diff tracking:** New `_compute_diff_summary()` in `transcript.py` computes consecutive diffs between old and new `code_drafts` — files added/deleted/modified with line-count deltas. Called automatically by `_append_coder_transcript()`.
+- **Condensed summaries:** `format_history()` now uses metadata for richer condensed summaries in the "Earlier iterations" section — e.g., `3 files changed (+45/−12)` instead of just `Generated 7 file(s): solver.py, ...`.
+- **Why:** Gives the LLM a structured trajectory of what happened (plans, changes, test results, decisions) so it can make better next-action decisions.
+- **Test count:** 19 new tests in `test_transcript.py`. Total: 295 tests passing.
+
+---
+
+### Ground Truth 9: `.venv` rglob poisoning in conftest generation (2025-04-02)
+
+- **Root cause chain:** When `pip install -e .` fails (e.g. build backend like `hatchling` not installed and `--no-build-isolation` is used), `_ensure_importable()` falls back to generating a `conftest.py` using `root.rglob("__init__.py")`. This rglob recurses into pre-existing `.venv/` directories, finds `__init__.py` files inside installed packages (numpy, scipy, mpl_toolkits, etc.), and adds their `site-packages` paths to `sys.path` in the generated conftest. When pytest runs, it finds potentially broken packages from the local `.venv` before the working ones from the explorer venv.
+- **Observed failure:** schrodinger-qwen run stuck for 4 iterations — all showed identical `ImportError: cannot import name 'version' from partially initialized module 'numpy'` because conftest.py injected `.venv/lib/python3.14/site-packages` into sys.path, shadowing the working numpy.
+- **Why existing defenses failed:**
+  - `_check_shadowed_packages()` only checks for coder-generated directories like `pytest/` or `numpy/`, not sys.path manipulation in conftest.
+  - `_preflight_check_imports()` validates the explorer environment (which is fine), not the runtime sys.path.
+  - The poisoned conftest persists across iterations (`if conftest.py exists: return`).
+- **Fix applied:**
+  1. **`_SKIP_DIRS`** — New frozenset of infrastructure directories (`.venv`, `venv`, `node_modules`, `.git`, `.tox`, etc.) excluded from rglob traversal in both `_prepare_sandbox()` and `_ensure_importable()`.
+  2. **`_pip_editable_install()`** — Retries `pip install -e .` without `--no-build-isolation` if the fast path fails, so pip can fetch the build backend (e.g. hatchling) itself.
+  3. **Refactored into helpers** — `_collect_path_roots()`, `_write_conftest()`, and `_pip_editable_install()` extracted for testability and DRY.
+- **Test count:** 7 new tests in `test_nodes.py` (TestCollectPathRoots: 5, TestEnsureImportable: 1 new, total: 301 tests passing).

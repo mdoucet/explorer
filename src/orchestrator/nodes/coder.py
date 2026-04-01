@@ -13,16 +13,16 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from . import _shared
-from ._shared import (
+from . import shared
+from .shared import (
     _format_code_listing,
     _invoke_llm,
     _load_prompt,
     make_llm_call_record,
 )
-from ._verifier import _check_shadowed_packages, _check_syntax, _prepare_sandbox, _run_pytest
+from .verifier import _check_shadowed_packages, _check_syntax, _prepare_sandbox, _run_pytest
 from ..state import ScientificState
-from ..transcript import format_history, make_entry
+from ..transcript import _compute_diff_summary, format_history, make_entry
 
 logger = logging.getLogger(__name__)
 
@@ -157,11 +157,25 @@ def _append_coder_transcript(
         parts.append(f"Deleted: {', '.join(sorted(deletions))}")
     if inner_iterations > 0:
         parts.append(f"Inner-loop self-corrections: {inner_iterations}")
+
+    old_drafts: dict[str, str] = state.get("code_drafts") or {}
+    diff = _compute_diff_summary(old_drafts, new_drafts)
+    parts.append(f"Changes: {diff['summary']}")
+
+    metadata: dict[str, Any] = {
+        "type": "code_change",
+        "files_added": diff["files_added"],
+        "files_deleted": diff["files_deleted"],
+        "files_modified": diff["files_modified"],
+        "diff_summary": diff["summary"],
+    }
+
     transcript.append(make_entry(
         "ai", "\n".join(parts),
         node="coder",
         step=state.get("iteration_count", 0),
         phase=state.get("current_phase", 0),
+        metadata=metadata,
     ))
     return transcript
 
@@ -258,7 +272,7 @@ def _tool_calling_coder(
     LLM, and runs a write-test-fix loop.  Falls back to text parsing if
     the LLM doesn't emit tool calls on the first turn.
     """
-    from ._tools import CoderSandbox, make_sandbox_tools, MAX_TOOL_ROUNDS
+    from .tools import CoderSandbox, make_sandbox_tools, MAX_TOOL_ROUNDS
     from langchain_core.messages import ToolMessage
 
     sandbox = CoderSandbox(existing_drafts if existing_drafts else None)
@@ -377,7 +391,7 @@ def coder(state: ScientificState) -> dict[str, Any]:
         the LLM response.  Accumulated over phases — prior-phase files are
         preserved.
     """
-    llm = _shared.get_llm()
+    llm = shared.get_llm()
     prompt = _load_prompt("EXPLORER_PROMPT_CODER", "coder.md")
 
     # Phase context for the coder
@@ -444,7 +458,7 @@ def coder(state: ScientificState) -> dict[str, Any]:
 
     # ── Tool-calling dispatch ───────────────────────────────────────────
     _fallback_llm_calls: list[dict] = []
-    if _shared.supports_tool_calling(llm):
+    if shared.supports_tool_calling(llm):
         tool_prompt = _load_prompt(
             "EXPLORER_PROMPT_CODER_TOOLS", "coder_tools.md",
         )

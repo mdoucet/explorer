@@ -7,8 +7,8 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from . import _shared
-from ._shared import (
+from . import shared
+from .shared import (
     _format_code_listing,
     _invoke_llm,
     _load_prompt,
@@ -77,7 +77,7 @@ def reflector(state: ScientificState) -> dict[str, Any]:
     and a ``## Key Findings`` section.  Findings are parsed locally and
     deduplicated against existing ``ground_truth``.
     """
-    llm = _shared.get_llm()
+    llm = shared.get_llm()
 
     reflector_prompt = _load_prompt("EXPLORER_PROMPT_REFLECTOR", "reflector.md")
 
@@ -160,6 +160,8 @@ def reflector(state: ScientificState) -> dict[str, Any]:
         step=state.get("iteration_count", 0),
         phase=state.get("current_phase", 0),
         summary=f"Analysis: {reflection.split(chr(10), 1)[0][:150]}",
+        metadata={"type": "analysis", "action": action,
+                  "new_findings": new_findings},
     ))
     return {
         "reflection": reflection,
@@ -214,6 +216,7 @@ def auto_reflect(state: ScientificState) -> dict[str, Any]:
         step=state.get("iteration_count", 0),
         phase=state.get("current_phase", 0),
         summary=f"Auto-reflect: {summary}",
+        metadata={"type": "analysis", "action": action, "new_findings": []},
     ))
 
     return {

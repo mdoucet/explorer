@@ -9,8 +9,8 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from . import _shared
-from ._shared import (
+from . import shared
+from .shared import (
     _invoke_llm,
     _load_prompt,
     make_llm_call_record,
@@ -158,7 +158,7 @@ def planner(state: ScientificState) -> dict[str, Any]:
        Revise the plan for the *current* phase, taking the error analysis
        and test logs into account so the coder can try a different approach.
     """
-    llm = _shared.get_llm()
+    llm = shared.get_llm()
 
     is_replan = bool(state.get("plan_phases")) and bool(state.get("reflection"))
 
@@ -243,6 +243,7 @@ def planner(state: ScientificState) -> dict[str, Any]:
             "ai", f"Revised plan for Phase {current + 1}:\n{plan_text}",
             node="planner", step=state.get("iteration_count", 0), phase=current,
             summary=f"Replanned Phase {current + 1}: {original_title}",
+            metadata={"type": "plan", "phases": [original_title], "is_replan": True},
         ))
         return {
             "plan": plan_text,
@@ -268,6 +269,7 @@ def planner(state: ScientificState) -> dict[str, Any]:
         "ai", raw_plan,
         node="planner", step=0, phase=0,
         summary=f"Plan: {len(plan_phases)} phases — {', '.join(phase_titles)}",
+        metadata={"type": "plan", "phases": phase_titles, "is_replan": False},
     ))
     return {
         "plan": plan_text,
@@ -311,6 +313,11 @@ def advance_phase(state: ScientificState) -> dict[str, Any]:
         f"Moving to Phase {next_idx + 1}: '{next_title}'.",
         node="advance_phase",
         step=state.get("iteration_count", 0), phase=next_idx,
+        metadata={
+            "type": "phase_advance",
+            "from_phase": current,
+            "to_phase": next_idx,
+        },
     ))
 
     return {

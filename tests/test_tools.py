@@ -590,8 +590,8 @@ class TestCoderToolDispatch:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """When supports_tool_calling is False, text mode is used."""
-        import orchestrator.nodes._shared as shared
-        import orchestrator.nodes._coder as _coder
+        import importlib; shared = importlib.import_module("orchestrator.nodes.shared")
+        _coder = importlib.import_module("orchestrator.nodes.coder")
 
         monkeypatch.setenv("EXPLORER_NO_TOOL_CALLING", "1")
 
@@ -613,8 +613,8 @@ class TestCoderToolDispatch:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """When supports_tool_calling is True, _tool_calling_coder is called."""
-        import orchestrator.nodes._shared as shared
-        import orchestrator.nodes._coder as _coder
+        import importlib; shared = importlib.import_module("orchestrator.nodes.shared")
+        _coder = importlib.import_module("orchestrator.nodes.coder")
 
         monkeypatch.delenv("EXPLORER_NO_TOOL_CALLING", raising=False)
 
@@ -648,8 +648,8 @@ class TestCoderToolDispatch:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """When tool-calling raises a tool-parse error, fall back to text mode."""
-        import orchestrator.nodes._shared as shared
-        import orchestrator.nodes._coder as _coder
+        import importlib; shared = importlib.import_module("orchestrator.nodes.shared")
+        _coder = importlib.import_module("orchestrator.nodes.coder")
 
         monkeypatch.delenv("EXPLORER_NO_TOOL_CALLING", raising=False)
 
@@ -675,8 +675,8 @@ class TestCoderToolDispatch:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Non-tool-parse errors still propagate."""
-        import orchestrator.nodes._shared as shared
-        import orchestrator.nodes._coder as _coder
+        import importlib; shared = importlib.import_module("orchestrator.nodes.shared")
+        _coder = importlib.import_module("orchestrator.nodes.coder")
 
         monkeypatch.delenv("EXPLORER_NO_TOOL_CALLING", raising=False)
 
@@ -699,7 +699,7 @@ class TestMakeLlmCallRecord:
     """Tests for the make_llm_call_record helper."""
 
     def test_basic_record_structure(self) -> None:
-        from orchestrator.nodes._shared import make_llm_call_record
+        from orchestrator.nodes.shared import make_llm_call_record
         from langchain_core.messages import SystemMessage, HumanMessage
 
         response = MagicMock()
@@ -730,7 +730,7 @@ class TestMakeLlmCallRecord:
         assert "timestamp" in record
 
     def test_captures_tool_calls(self) -> None:
-        from orchestrator.nodes._shared import make_llm_call_record
+        from orchestrator.nodes.shared import make_llm_call_record
         from langchain_core.messages import SystemMessage, HumanMessage
 
         response = MagicMock()
@@ -751,7 +751,7 @@ class TestMakeLlmCallRecord:
         assert len(record["tool_messages"]) == 1
 
     def test_captures_token_usage(self) -> None:
-        from orchestrator.nodes._shared import make_llm_call_record
+        from orchestrator.nodes.shared import make_llm_call_record
         from langchain_core.messages import HumanMessage
 
         response = MagicMock()
