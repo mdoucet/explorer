@@ -9,13 +9,17 @@ from unittest.mock import MagicMock
 import pytest
 
 from orchestrator.nodes import (
+    MAX_INNER_ITERATIONS,
+    _REPLAN_ERROR_REPEAT_THRESHOLD,
     _check_pyproject_toml,
+    _check_shadowed_packages,
     _check_syntax,
     _ensure_importable,
     _extract_action,
     _extract_findings,
     _format_code_listing,
     _llm_triage,
+    _merge_and_clean,
     _pick_replan_phase,
     _extract_signatures,
     _looks_like_filepath,
@@ -24,11 +28,13 @@ from orchestrator.nodes import (
     _parse_plan_phases,
     _parse_unfenced_blocks,
     _prepare_sandbox,
+    _quick_verify,
     _resolve_duplicate_layouts,
     _warn_stale_files,
     _write_code_drafts,
     _write_plan_artifact,
     advance_phase,
+    auto_reflect,
     coder,
     planner,
     reflector,
@@ -512,8 +518,8 @@ class TestReflectorContext:
         prompt = result["_prompt_summary"]
         assert "Run History" in prompt
         assert "brentq needs bracket" in prompt
-        # Transcript should grow by 1 (reflector appended its entry)
-        assert len(result["transcript"]) == 2
+        # Transcript delta contains only the new entry from this node
+        assert len(result["transcript"]) == 1
         assert result["transcript"][-1]["node"] == "reflector"
 
     def test_includes_prior_reflection(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -564,8 +570,8 @@ class TestCoderGroundTruthContext:
         prompt = result["_prompt_summary"]
         assert "Run History" in prompt
         assert "brentq not bisect" in prompt
-        # Transcript should grow by 1 (coder appended its entry)
-        assert len(result["transcript"]) == 2
+        # Transcript delta contains only the new entry from this node
+        assert len(result["transcript"]) == 1
         assert result["transcript"][-1]["node"] == "coder"
 
     def test_no_ground_truth_section_when_empty(
@@ -1584,6 +1590,58 @@ class TestCheckPyprojectToml:
 
 
 # ---------------------------------------------------------------------------
+# _check_shadowed_packages
+# ---------------------------------------------------------------------------
+
+
+class TestCheckShadowedPackages:
+    """_check_shadowed_packages should catch directories that shadow installed packages."""
+
+    def test_no_shadow_returns_empty(self) -> None:
+        drafts = {
+            "square_well/__init__.py": "",
+            "square_well/solver.py": "x = 1\n",
+            "tests/test_solver.py": "pass\n",
+        }
+        assert _check_shadowed_packages(drafts) == []
+
+    def test_pytest_directory_detected(self) -> None:
+        drafts = {
+            "square_well/solver.py": "x = 1\n",
+            "pytest/__init__.py": '"""stub pytest"""',
+        }
+        errors = _check_shadowed_packages(drafts)
+        assert len(errors) == 1
+        assert "pytest" in errors[0]
+        assert "shadows" in errors[0].lower()
+
+    def test_numpy_directory_detected(self) -> None:
+        drafts = {
+            "numpy/custom.py": "x = 1\n",
+        }
+        errors = _check_shadowed_packages(drafts)
+        assert len(errors) == 1
+        assert "numpy" in errors[0]
+
+    def test_multiple_shadows_all_reported(self) -> None:
+        drafts = {
+            "pytest/__init__.py": "",
+            "numpy/foo.py": "",
+            "square_well/solver.py": "x = 1\n",
+        }
+        errors = _check_shadowed_packages(drafts)
+        assert len(errors) == 2
+        combined = " ".join(errors)
+        assert "pytest" in combined
+        assert "numpy" in combined
+
+    def test_single_file_not_flagged(self) -> None:
+        """A file at the root level (no directory) should not be flagged."""
+        drafts = {"pytest.py": "x = 1\n"}
+        assert _check_shadowed_packages(drafts) == []
+
+
+# ---------------------------------------------------------------------------
 # _llm_triage
 # ---------------------------------------------------------------------------
 
@@ -1598,13 +1656,17 @@ class TestLlmTriage:
             "solver.py": "def solve(): pass\n",
             "tests/test_solver.py": "from solver import solve\ndef test_it(): solve()\n",
         }
-        assert _llm_triage(drafts, llm) == []
+        errors, record = _llm_triage(drafts, llm)
+        assert errors == []
+        assert record is not None
 
     def test_returns_empty_on_blank(self) -> None:
         """Empty LLM response treated as no issues."""
         llm = _FakeLLM("")
         drafts = {"solver.py": "def solve(): pass\n"}
-        assert _llm_triage(drafts, llm) == []
+        errors, record = _llm_triage(drafts, llm)
+        assert errors == []
+        assert record is not None
 
     def test_parses_bullet_issues(self) -> None:
         """Bullet-point issues are extracted as separate errors."""
@@ -1616,7 +1678,7 @@ class TestLlmTriage:
             "solver.py": "def solve(): pass\n",
             "tests/test_solver.py": "from solver import foo\ndef test_it(): foo()\n",
         }
-        errors = _llm_triage(drafts, llm)
+        errors, _ = _llm_triage(drafts, llm)
         assert len(errors) == 2
         assert "Import mismatch" in errors[0]
         assert "Contract mismatch" in errors[1]
@@ -1625,13 +1687,15 @@ class TestLlmTriage:
         """Non-.py files should not be sent to LLM."""
         llm = _FakeLLM("LGTM")
         drafts = {"pyproject.toml": "[project]\nname='x'\n"}
-        assert _llm_triage(drafts, llm) == []
+        errors, record = _llm_triage(drafts, llm)
+        assert errors == []
+        assert record is None  # No LLM call made
 
     def test_non_bullet_lines_included(self) -> None:
         """Non-header, non-empty lines are captured too."""
         llm = _FakeLLM("Layout conflict detected in solver.py")
         drafts = {"solver.py": "x = 1\n"}
-        errors = _llm_triage(drafts, llm)
+        errors, _ = _llm_triage(drafts, llm)
         assert len(errors) == 1
         assert "Layout conflict" in errors[0]
 
@@ -1639,7 +1703,7 @@ class TestLlmTriage:
         """Lines starting with # should be ignored."""
         llm = _FakeLLM("# Issues found\n- Bad import in test.py")
         drafts = {"solver.py": "x = 1\n", "tests/test_solver.py": "pass\n"}
-        errors = _llm_triage(drafts, llm)
+        errors, _ = _llm_triage(drafts, llm)
         assert len(errors) == 1
         assert "Bad import" in errors[0]
 
@@ -2329,3 +2393,464 @@ class TestPickReplanPhase:
         result = _pick_replan_phase(phases, "Solver")
         assert result is not None
         assert result["id"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Helpers for inner-loop tests
+# ---------------------------------------------------------------------------
+
+class _SequentialFakeLLM:
+    """Returns a different response for each successive ``invoke()`` call.
+
+    After all responses are exhausted, keeps returning the last one.
+    """
+
+    def __init__(self, responses: list[str]) -> None:
+        self._responses = responses
+        self._call = 0
+
+    def invoke(self, _messages: Any) -> Any:
+        idx = min(self._call, len(self._responses) - 1)
+        self._call += 1
+        msg = MagicMock()
+        msg.content = self._responses[idx]
+        return msg
+
+
+# ---------------------------------------------------------------------------
+# _quick_verify
+# ---------------------------------------------------------------------------
+
+class TestQuickVerify:
+    """Tests for the _quick_verify sandbox runner."""
+
+    def test_passing_code_returns_empty(self) -> None:
+        drafts = {
+            "mymath/__init__.py": "",
+            "mymath/factorial.py": (
+                "def factorial(n: int) -> int:\n"
+                "    return 1 if n <= 1 else n * factorial(n - 1)\n"
+            ),
+            "tests/test_factorial.py": (
+                "from mymath.factorial import factorial\n"
+                "def test_base():\n"
+                "    assert factorial(0) == 1\n"
+                "def test_five():\n"
+                "    assert factorial(5) == 120\n"
+            ),
+        }
+        errors = _quick_verify(drafts)
+        assert errors == []
+
+    def test_syntax_error_caught(self) -> None:
+        drafts = {
+            "bad.py": "def broken(\n",
+        }
+        errors = _quick_verify(drafts)
+        assert len(errors) > 0
+        assert any("SyntaxError" in e for e in errors)
+
+    def test_failing_test_returns_errors(self) -> None:
+        drafts = {
+            "mymath/__init__.py": "",
+            "mymath/factorial.py": "def factorial(n): return -1\n",
+            "tests/test_factorial.py": (
+                "from mymath.factorial import factorial\n"
+                "def test_five():\n"
+                "    assert factorial(5) == 120\n"
+            ),
+        }
+        errors = _quick_verify(drafts)
+        assert len(errors) > 0
+
+    def test_empty_drafts_returns_empty(self) -> None:
+        assert _quick_verify({}) == []
+
+
+# ---------------------------------------------------------------------------
+# _merge_and_clean
+# ---------------------------------------------------------------------------
+
+class TestMergeAndClean:
+    def test_merges_new_into_existing(self) -> None:
+        existing = {"a.py": "old_a\n", "b.py": "old_b\n"}
+        new = {"b.py": "new_b\n", "c.py": "new_c\n"}
+        merged = _merge_and_clean(new, existing, set())
+        assert merged == {"a.py": "old_a\n", "b.py": "new_b\n", "c.py": "new_c\n"}
+
+    def test_applies_deletions(self) -> None:
+        existing = {"a.py": "a\n", "b.py": "b\n"}
+        new: dict[str, str] = {}
+        merged = _merge_and_clean(new, existing, {"a.py"})
+        assert "a.py" not in merged
+        assert "b.py" in merged
+
+
+# ---------------------------------------------------------------------------
+# Coder inner loop
+# ---------------------------------------------------------------------------
+
+class TestCoderInnerLoop:
+    """The coder's inner self-correction loop should re-invoke the LLM
+    when initial output fails quick verification."""
+
+    def test_no_inner_loop_when_tests_pass(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When code passes tests on first try, no inner-loop iterations."""
+        llm_output = (
+            "```mymath/__init__.py\n```\n"
+            "```mymath/factorial.py\n"
+            "def factorial(n: int) -> int:\n"
+            "    return 1 if n <= 1 else n * factorial(n - 1)\n"
+            "```\n"
+            "```tests/test_factorial.py\n"
+            "from mymath.factorial import factorial\n"
+            "def test_base():\n"
+            "    assert factorial(0) == 1\n"
+            "```\n"
+        )
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
+
+        state = _base_state(plan="implement factorial")
+        result = coder(state)
+
+        assert result["_inner_loop_count"] == 0
+        assert "mymath/factorial.py" in result["code_drafts"]
+
+    def test_inner_loop_fixes_broken_code(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When first attempt has a bug, inner loop should self-correct."""
+        # First response: broken (always returns -1)
+        broken_output = (
+            "```mymath/__init__.py\n```\n"
+            "```mymath/factorial.py\n"
+            "def factorial(n: int) -> int:\n"
+            "    return -1\n"
+            "```\n"
+            "```tests/test_factorial.py\n"
+            "from mymath.factorial import factorial\n"
+            "def test_five():\n"
+            "    assert factorial(5) == 120\n"
+            "```\n"
+        )
+        # Second response: fixed
+        fixed_output = (
+            "```mymath/__init__.py\n```\n"
+            "```mymath/factorial.py\n"
+            "def factorial(n: int) -> int:\n"
+            "    return 1 if n <= 1 else n * factorial(n - 1)\n"
+            "```\n"
+            "```tests/test_factorial.py\n"
+            "from mymath.factorial import factorial\n"
+            "def test_five():\n"
+            "    assert factorial(5) == 120\n"
+            "```\n"
+        )
+        fake = _SequentialFakeLLM([broken_output, fixed_output])
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
+
+        state = _base_state(plan="implement factorial")
+        result = coder(state)
+
+        assert result["_inner_loop_count"] == 1
+        assert "factorial" in result["code_drafts"]["mymath/factorial.py"]
+        # The final code should be the fixed version
+        assert "n - 1" in result["code_drafts"]["mymath/factorial.py"]
+
+    def test_inner_loop_capped_at_max(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Inner loop should not exceed MAX_INNER_ITERATIONS attempts."""
+        # All responses are broken — loop should stop at the cap
+        broken_output = (
+            "```mymath/__init__.py\n```\n"
+            "```mymath/factorial.py\n"
+            "def factorial(n: int) -> int:\n"
+            "    return -1\n"
+            "```\n"
+            "```tests/test_factorial.py\n"
+            "from mymath.factorial import factorial\n"
+            "def test_five():\n"
+            "    assert factorial(5) == 120\n"
+            "```\n"
+        )
+        fake = _SequentialFakeLLM([broken_output] * (MAX_INNER_ITERATIONS + 1))
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
+
+        state = _base_state(plan="implement factorial")
+        result = coder(state)
+
+        # Should have done MAX_INNER_ITERATIONS - 1 corrections
+        # (first attempt + up to MAX-1 corrections = MAX total attempts)
+        assert result["_inner_loop_count"] == MAX_INNER_ITERATIONS - 1
+        # LLM should have been called exactly MAX_INNER_ITERATIONS times
+        assert fake._call == MAX_INNER_ITERATIONS
+
+    def test_inner_loop_transcript_records_self_corrections(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Transcript entry should mention inner-loop self-corrections."""
+        broken_output = (
+            "```mymath/__init__.py\n```\n"
+            "```mymath/factorial.py\n"
+            "def factorial(n: int) -> int:\n"
+            "    return -1\n"
+            "```\n"
+            "```tests/test_factorial.py\n"
+            "from mymath.factorial import factorial\n"
+            "def test_five():\n"
+            "    assert factorial(5) == 120\n"
+            "```\n"
+        )
+        fixed_output = (
+            "```mymath/__init__.py\n```\n"
+            "```mymath/factorial.py\n"
+            "def factorial(n: int) -> int:\n"
+            "    return 1 if n <= 1 else n * factorial(n - 1)\n"
+            "```\n"
+            "```tests/test_factorial.py\n"
+            "from mymath.factorial import factorial\n"
+            "def test_five():\n"
+            "    assert factorial(5) == 120\n"
+            "```\n"
+        )
+        fake = _SequentialFakeLLM([broken_output, fixed_output])
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
+
+        state = _base_state(plan="implement factorial")
+        result = coder(state)
+
+        transcript_entry = result["transcript"][-1]
+        assert "Inner-loop self-corrections: 1" in transcript_entry["content"]
+
+    def test_inner_loop_skipped_when_no_code_blocks(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If LLM returns no parsable code, skip inner loop gracefully."""
+        fake = _FakeLLM("Here are some thoughts but no code blocks.")
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
+
+        state = _base_state(plan="implement something")
+        result = coder(state)
+
+        assert result["_inner_loop_count"] == 0
+        assert result["code_drafts"] == {}
+
+    def test_inner_loop_catches_syntax_errors(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Syntax errors should trigger inner-loop correction."""
+        syntax_broken = (
+            "```mymath/__init__.py\n```\n"
+            "```mymath/calc.py\n"
+            "def broken(\n"
+            "```\n"
+            "```tests/test_calc.py\n"
+            "from mymath.calc import broken\n"
+            "def test_it():\n"
+            "    assert broken() is None\n"
+            "```\n"
+        )
+        fixed = (
+            "```mymath/__init__.py\n```\n"
+            "```mymath/calc.py\n"
+            "def broken():\n"
+            "    return None\n"
+            "```\n"
+            "```tests/test_calc.py\n"
+            "from mymath.calc import broken\n"
+            "def test_it():\n"
+            "    assert broken() is None\n"
+            "```\n"
+        )
+        fake = _SequentialFakeLLM([syntax_broken, fixed])
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
+
+        state = _base_state(plan="implement calc")
+        result = coder(state)
+
+        assert result["_inner_loop_count"] == 1
+        assert "def broken():" in result["code_drafts"]["mymath/calc.py"]
+
+
+# ---------------------------------------------------------------------------
+# Planner tool_calling dispatch (Phase 3)
+# ---------------------------------------------------------------------------
+
+class TestPlannerDirectMode:
+    """Verify the planner uses planner_direct.md when tool_calling is True."""
+
+    def test_uses_direct_prompt_when_tool_calling(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """When state has tool_calling=True, planner loads planner_direct.md."""
+        monkeypatch.chdir(tmp_path)
+        llm_output = (
+            "## Phase 1: Solver\n"
+            "Implement the solver with full tests.\n"
+            "Files: solver.py, tests/test_solver.py\n"
+        )
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
+
+        # Track which prompt file is loaded
+        loaded_prompts: list[str] = []
+
+        from orchestrator.nodes._shared import _load_prompt as orig_lp
+
+        def spy_load_prompt(env_var: str, default_filename: str) -> str:
+            loaded_prompts.append(default_filename)
+            return orig_lp(env_var, default_filename)
+
+        monkeypatch.setattr("orchestrator.nodes._planner._load_prompt", spy_load_prompt)
+
+        state = _base_state(tool_calling=True)
+        result = planner(state)
+
+        assert "planner_direct.md" in loaded_prompts
+        assert "planner.md" not in loaded_prompts
+        assert len(result["plan_phases"]) == 1
+
+    def test_uses_standard_prompt_without_tool_calling(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """When tool_calling is False/missing, planner uses planner.md."""
+        monkeypatch.chdir(tmp_path)
+        llm_output = (
+            "## Phase 1: Scaffolding\nStub it out.\nFiles: solver.py\n\n"
+            "## Phase 2: Solver\nImplement solver.\nFiles: solver.py\n"
+        )
+        fake = _FakeLLM(llm_output)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
+
+        loaded_prompts: list[str] = []
+        from orchestrator.nodes._shared import _load_prompt as orig_lp
+
+        def spy_load_prompt(env_var: str, default_filename: str) -> str:
+            loaded_prompts.append(default_filename)
+            return orig_lp(env_var, default_filename)
+
+        monkeypatch.setattr("orchestrator.nodes._planner._load_prompt", spy_load_prompt)
+
+        state = _base_state(tool_calling=False)
+        result = planner(state)
+
+        assert "planner.md" in loaded_prompts
+        assert "planner_direct.md" not in loaded_prompts
+        assert len(result["plan_phases"]) == 2
+
+    def test_replan_ignores_tool_calling(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Replanning always uses planner_replan.md, regardless of tool_calling."""
+        monkeypatch.chdir(tmp_path)
+        replan_output = "Revised: try algorithm B instead."
+        fake = _FakeLLM(replan_output)
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
+
+        loaded_prompts: list[str] = []
+        from orchestrator.nodes._shared import _load_prompt as orig_lp
+
+        def spy_load_prompt(env_var: str, default_filename: str) -> str:
+            loaded_prompts.append(default_filename)
+            return orig_lp(env_var, default_filename)
+
+        monkeypatch.setattr("orchestrator.nodes._planner._load_prompt", spy_load_prompt)
+
+        phases = [
+            {"id": 1, "title": "Core", "description": "Old desc.",
+             "status": "pending", "files": []},
+        ]
+        state = _base_state(
+            tool_calling=True,
+            reflection="stuck on error X",
+            plan_phases=phases,
+            current_phase=0,
+        )
+        result = planner(state)
+
+        assert "planner_replan.md" in loaded_prompts
+        assert "planner_direct.md" not in loaded_prompts
+
+
+# ---------------------------------------------------------------------------
+# auto_reflect (Phase 4)
+# ---------------------------------------------------------------------------
+
+class TestAutoReflect:
+    """Tests for the lightweight auto_reflect node."""
+
+    def test_retry_on_first_failure(self) -> None:
+        """First failure returns retry action."""
+        state = _base_state(
+            test_logs=["FAILED test_foo - AssertionError"],
+            _error_repeat_count=1,
+            _phase_iteration_count=1,
+        )
+        result = auto_reflect(state)
+
+        assert result["_reflector_action"] == "retry"
+        assert "reflection" in result
+        assert "FAILED" in result["reflection"]
+
+    def test_replan_after_repeated_errors(self) -> None:
+        """Repeated same error triggers replan."""
+        state = _base_state(
+            test_logs=["FAILED test_foo - same error"],
+            _error_repeat_count=_REPLAN_ERROR_REPEAT_THRESHOLD,
+            _phase_iteration_count=5,
+        )
+        result = auto_reflect(state)
+
+        assert result["_reflector_action"] == "replan"
+        assert "replan" in result["transcript"][-1]["content"].lower()
+
+    def test_replan_just_below_threshold_retries(self) -> None:
+        """One below threshold still retries."""
+        state = _base_state(
+            test_logs=["error output"],
+            _error_repeat_count=_REPLAN_ERROR_REPEAT_THRESHOLD - 1,
+            _phase_iteration_count=3,
+        )
+        result = auto_reflect(state)
+
+        assert result["_reflector_action"] == "retry"
+
+    def test_truncates_long_logs(self) -> None:
+        """Very long test logs are truncated in reflection."""
+        long_log = "x" * 5000
+        state = _base_state(
+            test_logs=[long_log],
+            _error_repeat_count=1,
+        )
+        result = auto_reflect(state)
+
+        assert len(result["reflection"]) == 3000
+
+    def test_appends_transcript(self) -> None:
+        """auto_reflect appends to transcript."""
+        existing = [make_entry("ai", "prior", node="coder", step=0, phase=0)]
+        state = _base_state(
+            test_logs=["test failure"],
+            _error_repeat_count=1,
+            transcript=existing,
+        )
+        result = auto_reflect(state)
+
+        # Transcript delta contains only the new entry from this node
+        assert len(result["transcript"]) == 1
+        assert result["transcript"][-1]["node"] == "auto_reflect"
+
+    def test_no_ground_truth_mutation(self) -> None:
+        """auto_reflect does not modify ground_truth (no LLM extraction)."""
+        state = _base_state(
+            test_logs=["FAILED"],
+            ground_truth=["- existing finding"],
+            _error_repeat_count=1,
+        )
+        result = auto_reflect(state)
+
+        assert "ground_truth" not in result

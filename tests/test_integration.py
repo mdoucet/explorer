@@ -113,23 +113,20 @@ def test_five():
     assert factorial(5) == 120
 ```
 """
-        reflection = (
-            "The function returns a hardcoded -1 instead of computing the factorial.\n\n"
-            "## Key Findings\n"
-            "- The coder produced a stub instead of real logic\n\n"
-            "## Action\n"
-            "RETRY"
-        )
-
-        # Sequence: plan → bad code → triage → reflection (with findings) → good code → triage
-        # (reflector routes directly to coder, skipping the planner on revision)
+        # With the inner self-correction loop, the coder catches the bad code
+        # internally and self-corrects before returning to the outer graph.
+        #
+        # Sequence:
+        #   planner  → _PLAN_RESPONSE
+        #   coder #1 → bad_code → inner quick-verify fails
+        #   coder #2 → _CODE_RESPONSE (inner-loop self-correction) → quick-verify passes
+        #   triage   → "LGTM"
+        #   verifier → pytest passes → done (1 outer iteration)
         fake = _SequenceLLM([
-            _PLAN_RESPONSE,   # planner #1
-            bad_code,          # coder #1 (will fail)
-            "LGTM",           # triage #1 (falls through to pytest)
-            reflection,        # reflector (single call: analysis + findings)
-            _CODE_RESPONSE,   # coder #2 (will pass)
-            "LGTM",           # triage #2 (falls through to pytest)
+            _PLAN_RESPONSE,   # planner
+            bad_code,          # coder attempt 1 (inner loop catches failure)
+            _CODE_RESPONSE,   # coder attempt 2 (inner loop self-correction)
+            "LGTM",           # triage (verifier)
         ])
         monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
 
@@ -151,7 +148,8 @@ def test_five():
 
         final = app.invoke(initial)
 
-        assert final["iteration_count"] == 2
+        # Inner loop fixes the bug — only 1 outer verifier iteration needed
+        assert final["iteration_count"] == 1
         assert final["test_logs"] == []
 
 
@@ -242,3 +240,73 @@ def test_five():
         # Second run should succeed — tests now pass
         assert run2_final.get("test_logs") == []
         assert run2_final.get("iteration_count", 0) >= 2
+
+
+class TestToolCallingSkipsReflector:
+    """When tool_calling=True, failures route through auto_reflect, not reflector."""
+
+    def test_auto_reflect_bypasses_llm_reflector(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        bad_code = """\
+```factorial.py
+def factorial(n: int) -> int:
+    return -1
+```
+
+```tests/test_factorial.py
+from factorial import factorial
+
+def test_five():
+    assert factorial(5) == 120
+```
+"""
+        # Sequence for tool_calling=True path:
+        #   planner      → _PLAN_RESPONSE  (uses planner_direct.md)
+        #   coder #1     → bad_code → inner quick-verify fails
+        #   coder #2     → bad_code → inner quick-verify fails
+        #   coder #3     → bad_code → (max inner loop, returns)
+        #   verifier     → pytest fails → routes to auto_reflect (no LLM!)
+        #   auto_reflect → retry (no LLM call)
+        #   coder #1     → _CODE_RESPONSE → inner quick-verify passes
+        #   verifier     → pytest passes → end
+        #
+        # Total LLM calls: planner + 3 inner + 1 retry = 5
+        # (NO reflector LLM call, NO triage LLM call)
+        fake = _SequenceLLM([
+            _PLAN_RESPONSE,   # planner
+            bad_code,          # coder inner 1
+            bad_code,          # coder inner 2
+            bad_code,          # coder inner 3 (max)
+            _CODE_RESPONSE,   # coder retry (after auto_reflect)
+        ])
+        monkeypatch.setattr("orchestrator.nodes._shared.get_llm", lambda: fake)
+
+        from src.cli import build_graph
+
+        graph = build_graph()
+        app = graph.compile()
+
+        initial: ScientificState = {
+            "task_description": "Implement a factorial function",
+            "mathematical_constants": {},
+            "plan": "",
+            "code_drafts": {},
+            "test_logs": [],
+            "reflection": "",
+            "iteration_count": 0,
+            "ground_truth": [],
+            "tool_calling": True,
+        }
+
+        # Track which nodes were visited
+        visited_nodes: list[str] = []
+        final: dict = dict(initial)
+        for event in app.stream(initial):
+            for node_name, update in event.items():
+                visited_nodes.append(node_name)
+                final.update(update)
+
+        assert final["test_logs"] == []
+        assert "reflector" not in visited_nodes
+        assert "auto_reflect" in visited_nodes

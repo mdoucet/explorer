@@ -49,6 +49,9 @@ Project structure:
 - Use the file paths specified in the plan.  If the plan uses a `src/` layout
   (e.g. `src/my_package/solver.py`), follow that.  If it uses a flat layout
   (e.g. `my_package/solver.py`), follow that.  Do NOT mix both layouts.
+- NEVER create directories named after installed packages (e.g. ``pytest/``,
+  ``numpy/``, ``scipy/``, ``matplotlib/``, ``click/``).  A local directory
+  shadows the real package and breaks all imports and test execution.
 - Every package directory MUST have an __init__.py.
 - Test files go in tests/ and import from the package name:
   from my_package.solver import solve  ← CORRECT
@@ -107,6 +110,15 @@ When fixing test failures ("Previous error analysis" section is present):
 - Do NOT regenerate test files.  Only emit the source files that need changes.
 - If a test expectation is truly wrong, explain why in a comment but still
   do not change it — the reflector must explicitly flag test errors first.
+
+Matplotlib / plotting:
+- NEVER call ``plt.show()`` — it blocks execution and halts the workflow.
+  Always save figures to files with ``plt.savefig("plot.png")`` and
+  ``plt.close()`` instead.  If a CLI has a ``--plot`` flag, it must save
+  to a file (default ``plot.png`` or accept ``--output``), not display
+  interactively.
+- Always set the backend to Agg at the top of any module that imports
+  matplotlib: ``matplotlib.use("Agg")`` (before importing pyplot).
 
 Docstring safety:
 - NEVER use backslash-prefixed LaTeX commands (like \psi, \hbar, \frac)

@@ -13,6 +13,10 @@ quantum potential wells.
 
 ## Instructions
 
+### IMPORTANT BACKGROUND INFORMATION
+
+- The user may be using this skill for a problem that has no known solution. Do not assume that you know the exact numerical values or the number of energy eigenvalues or wavefunctions in advance. Instead, write code that can compute these from the mathematical properties of the system, and write tests that verify these properties rather than specific numbers.
+
 ### Physical conventions
 
 - Default to **atomic units** ($\hbar = 1$, $m_e = 1$) unless the task
@@ -94,8 +98,55 @@ produces `NaN`.
 
 ### Testing guidance
 
-- Compare eigenvalues against analytically known limits (e.g. infinite-well
-  limit: $E_n = \frac{n^2\pi^2\hbar^2}{2m(2a)^2}$).
-- Use tolerances appropriate for the numerical method (typically `rtol=1e-6`).
-- Test both even-parity and odd-parity states separately.
-- Verify normalisation: `np.trapz(np.abs(psi)**2, x)` ≈ 1.
+- NEVER assume that you know the exact numerical values or the number of energy eigenvalues or wavefunctions in advance.  Instead, write tests that verify the mathematical properties of the solutions (e.g. normalisation, boundary conditions, asymptotic behaviour) rather than specific numbers.
+- When computing wavefunctions, verify normalisation: `np.trapz(np.abs(psi)**2, x)` ≈ 1.
+
+### Counting bound states — correct formula
+
+For a symmetric finite square well with dimensionless parameter
+$C = a\sqrt{2mV_0}/\hbar$, the total number of bound states is:
+
+$$
+N = \left\lceil \frac{2C}{\pi} \right\rceil
+$$
+
+**Common mistake:** using `floor(C/π) * 2`.  This is WRONG because
+even-parity states start at $n = 0$, giving `floor(C/π) + 1` even states
+(one more than odd), so multiplying by 2 undercounts by one when an extra
+even state exists.  For C = 10: `floor(10/π) * 2 = 6` but the correct
+answer is `ceil(20/π) = 7`.
+
+**NEVER hardcode the state count in the solver or use it to truncate results.**
+Let the root-finder discover all roots and return them all.
+
+### Test patterns
+
+**Good** — verify properties of each returned eigenvalue:
+```python
+def test_transcendental_residuals():
+    energies = find_bound_energies()
+    assert len(energies) >= 1  # at least one bound state
+    for E in energies:
+        k = np.sqrt(2 * m * (E + V0))
+        kappa = np.sqrt(-2 * m * E)
+        # Check even or odd transcendental equation is satisfied
+        res_even = k * np.tan(k * a) - kappa
+        res_odd = -k / np.tan(k * a) - kappa
+        assert min(abs(res_even), abs(res_odd)) < 1e-8
+```
+
+**Good** — verify count AFTER implementation using `ceil(2C/π)`:
+```python
+def test_correct_number_of_bound_states():
+    energies = find_bound_energies()
+    C = a * np.sqrt(2 * m * V0) / hbar
+    expected_count = int(np.ceil(2 * C / np.pi))
+    assert len(energies) == expected_count
+```
+
+**BAD** — hardcoding a wrong formula as "upper bound":
+```python
+# DO NOT DO THIS — floor(C/π)*2 is incorrect!
+expected = int(np.floor(C / np.pi)) * 2
+assert len(energies) <= expected
+```

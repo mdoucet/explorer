@@ -7,9 +7,10 @@ exposed here so that long-running sessions can be interrupted and resumed.
 
 from __future__ import annotations
 
+import operator
 import sqlite3
 from contextlib import contextmanager
-from typing import Iterator, TypedDict
+from typing import Annotated, Iterator, TypedDict
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
@@ -54,6 +55,9 @@ class ScientificState(TypedDict, total=False):
     clean_files : list[str]
         File paths that had no syntax or import errors on the last verifier
         run.  The coder is told not to modify these unless necessary.
+    tool_calling : bool
+        Whether the coder is using tool-calling mode.  When True, the planner
+        skips the mandatory stubs-first phase and allows direct implementation.
     """
 
     task_description: str
@@ -76,7 +80,10 @@ class ScientificState(TypedDict, total=False):
     clean_files: list[str]
     _collection_error: bool
     _reflector_action: str
-    transcript: list[dict]
+    _inner_loop_count: int
+    tool_calling: bool
+    transcript: Annotated[list[dict], operator.add]
+    _llm_calls: Annotated[list[dict], operator.add]
 
 
 def make_checkpointer(db_path: str = "checkpoints.sqlite") -> SqliteSaver:

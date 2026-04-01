@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ from . import _shared
 from ._shared import (
     _invoke_llm,
     _load_prompt,
+    make_llm_call_record,
 )
 from ..state import ScientificState
 from ..transcript import format_history, make_entry
@@ -195,13 +197,28 @@ def planner(state: ScientificState) -> dict[str, Any]:
     # scaffolding when it should be revising the solver/implementation.
     if is_replan:
         prompt = _load_prompt("EXPLORER_PROMPT_PLANNER_REPLAN", "planner_replan.md")
+    elif state.get("tool_calling"):
+        # Tool-calling mode: skip mandatory stubs-first scaffolding
+        prompt = _load_prompt("EXPLORER_PROMPT_PLANNER_DIRECT", "planner_direct.md")
     else:
         prompt = _load_prompt("EXPLORER_PROMPT_PLANNER", "planner.md")
     user_message = "\n\n".join(user_parts)
-    response = _invoke_llm(llm, [
+    messages = [
         SystemMessage(content=prompt),
         HumanMessage(content=user_message),
-    ])
+    ]
+    t0 = time.monotonic()
+    response = _invoke_llm(llm, messages)
+    duration = time.monotonic() - t0
+
+    llm_calls: list[dict] = []
+    llm_calls.append(make_llm_call_record(
+        node="planner",
+        messages=messages,
+        response=response,
+        duration_s=duration,
+        label="replan" if is_replan else "plan",
+    ))
 
     raw_plan = response.content
 
@@ -221,7 +238,7 @@ def planner(state: ScientificState) -> dict[str, Any]:
                 phases[current]["files"] = best["files"]
         plan_text = phases[current]["description"]
         _write_plan_artifact(phases, current)
-        transcript = list(state.get("transcript") or [])
+        transcript: list[dict] = []
         transcript.append(make_entry(
             "ai", f"Revised plan for Phase {current + 1}:\n{plan_text}",
             node="planner", step=state.get("iteration_count", 0), phase=current,
@@ -234,6 +251,7 @@ def planner(state: ScientificState) -> dict[str, Any]:
             "_error_repeat_count": 0,  # reset after replan
             "_replan_count": state.get("_replan_count", 0) + 1,
             "transcript": transcript,
+            "_llm_calls": llm_calls,
         }
 
     plan_phases = _parse_plan_phases(raw_plan)
@@ -244,7 +262,7 @@ def planner(state: ScientificState) -> dict[str, Any]:
 
     _write_plan_artifact(plan_phases, current_phase)
 
-    transcript = list(state.get("transcript") or [])
+    transcript: list[dict] = []
     phase_titles = [p["title"] for p in plan_phases]
     transcript.append(make_entry(
         "ai", raw_plan,
@@ -257,6 +275,7 @@ def planner(state: ScientificState) -> dict[str, Any]:
         "current_phase": current_phase,
         "_prompt_summary": user_message,
         "transcript": transcript,
+        "_llm_calls": llm_calls,
     }
 
 
@@ -283,7 +302,7 @@ def advance_phase(state: ScientificState) -> dict[str, Any]:
 
     _write_plan_artifact(phases, next_idx)
 
-    transcript = list(state.get("transcript") or [])
+    transcript: list[dict] = []
     prev_title = phases[current]["title"]
     next_title = phases[next_idx]["title"]
     transcript.append(make_entry(

@@ -607,3 +607,38 @@ Four fixes re-applied on top of `7a8565d` ("update for larger LLMs"), addressing
 ### Impact
 - nodes.py: 1377 → ~1370 lines (small net reduction — gained helper, simplified 3 call sites)
 - Tests: 196 → 201 (5 new `_format_code_listing` tests)
+
+## Phase 1 Upgrade: Inner Coder Self-Correction Loop
+
+- **Motivation:** Analysis of a VS Code Copilot agent trace (JSONL) showed it solved the Schrödinger problem in ~1 LLM turn by immediately running code and fixing errors in the same session. Our agent required 5–20 outer graph cycles (3–4 LLM calls each). The inner loop closes this feedback gap.
+- **What changed:** The `coder()` node now runs `_quick_verify()` (syntax check + pytest in a temp sandbox) after each LLM generation. If tests fail, the error output is appended to the conversation and the LLM is re-invoked — up to `MAX_INNER_ITERATIONS` (3) total attempts — before returning to the outer graph.
+- **Key design decisions:**
+  - Clean-file protection from the outer state applies on **every** inner-loop iteration, not just the first — prevents the LLM from regressing verified-clean files during self-correction.
+  - The inner loop skips verification on the last attempt (lets the outer verifier handle it) to avoid wasting time on unrecoverable failures.
+  - `_quick_verify()` is lightweight: syntax check + pytest, no LLM triage. Keeps inner-loop latency low.
+  - `_merge_and_clean()` extracted as a helper since the merge+delete+layout-resolution sequence is needed on every inner iteration.
+- **New state field:** `_inner_loop_count: int` — tracks how many self-correction iterations the coder used.
+- **Reporter:** Shows `⟳ N inner-loop self-correction(s)` in the coder's output when `_inner_loop_count > 0`.
+- **Transcript:** Coder transcript entry includes `Inner-loop self-corrections: N` when N > 0.
+- **Integration test impact:** `TestLoopReflectsOnFailure` now expects `iteration_count == 1` (was 2) because the inner loop fixes the bad code before the outer verifier runs, eliminating the reflector round-trip.
+- **Tests:** 201 → 213 (added 10 new tests: `TestQuickVerify` (4), `TestMergeAndClean` (2), `TestCoderInnerLoop` (6)).
+
+## Planner Hardcodes Wrong Eigenstate Count (April 2026)
+
+### Problem: Solver Output Truncated by Wrong Formula from Plan Tests
+- **Run:** `~/git/schrodinger-qwen`, Qwen 2.5-Coder 32B (tool-calling mode)
+- **Symptom:** `square_well.cli solve` returns 6 bound states; the correct answer is 7. The shallowest even-parity state (E ≈ -3.16) is missing.
+- **Root cause chain:**
+  1. **Planner** wrote test `test_number_of_bound_states_default` with formula `expected = int(np.floor(C/np.pi)) * 2` (= 6 for C = 10). This formula is **wrong** — it undercounts by 1 because even-parity states start at n=0, giving `floor(C/π) + 1` even states, not `floor(C/π)`.
+  2. **Coder** added truncation `max_states = floor(C/π) * 2; energies = energies[:max_states]` to match the test.
+  3. **Verifier** ran tests → all passed (wrong test was satisfied).
+  4. **Reflector** never engaged (no failures).
+- **Correct formula:** Total bound states = `ceil(2C/π)`. For C = 10: `ceil(20/π) = 7`.
+- **Key insight 1:** The quantum-mechanics skill already said "NEVER assume you know the exact number of eigenvalues" but the planner ignored this guidance and hardcoded a formula. Skill guidance cannot force LLM behavior — critical constraints must also be reinforced in the planner prompt itself.
+- **Key insight 2:** When the planner writes tests with specific numerical expectations derived from a formula, and the formula is wrong, the entire system has no mechanism to catch the error. Tests pass → verifier succeeds → no reflector → shipped with bug.
+- **Key insight 3:** Quantities that emerge from computation (number of roots, number of eigenvalues) should NOT be hardcoded in tests written before implementation. The correct pattern is: (a) test each result individually (residual checks), (b) use lower-bound count tests during initial implementation, (c) re-derive exact count from working code as a post-implementation validation step.
+
+### Fixes Applied
+1. **`prompts/planner_direct.md`** — Added "Emergent quantities" rule: don't hardcode solver-derived counts. Use property-based assertions and lower bounds. Re-derive exact counts after implementation.
+2. **`prompts/planner.md`** — Same rule for scaffold mode.
+3. **`skills/quantum-mechanics/SKILL.md`** — Added "Counting bound states" section with correct formula `ceil(2C/π)`, explicit warning against `floor(C/π)*2`, and good/bad test patterns.

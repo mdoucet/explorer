@@ -25,7 +25,7 @@ import click
 from dotenv import load_dotenv
 from langgraph.graph import END, StateGraph
 
-from orchestrator.nodes import advance_phase, coder, configure_llm, get_llm, planner, reflector, verifier
+from orchestrator.nodes import advance_phase, auto_reflect, coder, configure_llm, get_llm, planner, reflector, verifier
 from orchestrator.state import ScientificState, make_checkpointer
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,42 @@ load_dotenv()
 
 MAX_ITERATIONS = int(os.environ.get("EXPLORER_MAX_ITERATIONS", "20"))  # 0 = unlimited
 
+# Packages that the verifier sandbox commonly needs.  If any of these
+# can't be imported in the current Python, every pytest run will fail
+# at collection time with a confusing ModuleNotFoundError.
+_REQUIRED_PACKAGES = ("numpy", "scipy")
+
+
+def _preflight_check_imports() -> None:
+    """Verify that critical packages can be imported before starting.
+
+    Catches broken installations (e.g. Xcode system Python 3.9 with
+    incompatible numpy wheels) and gives a clear error instead of
+    looping through verifier failures.
+    """
+    broken: list[tuple[str, str]] = []
+    for pkg in _REQUIRED_PACKAGES:
+        try:
+            __import__(pkg)
+        except Exception as exc:  # noqa: BLE001
+            broken.append((pkg, str(exc)))
+    if broken:
+        lines = [
+            "Pre-flight check failed — required packages cannot be imported:",
+        ]
+        for pkg, err in broken:
+            lines.append(f"  • {pkg}: {err}")
+        lines.append("")
+        lines.append(
+            f"Current Python: {sys.executable} "
+            f"(v{sys.version.split()[0]})"
+        )
+        lines.append(
+            "Fix: use a supported Python (≥3.10) and reinstall: "
+            "pip install numpy scipy"
+        )
+        raise click.UsageError("\n".join(lines))
+
 
 # ---------------------------------------------------------------------------
 # Graph construction
@@ -43,10 +79,11 @@ MAX_ITERATIONS = int(os.environ.get("EXPLORER_MAX_ITERATIONS", "20"))  # 0 = unl
 def _make_should_continue(max_iters: int):
     """Return a conditional edge function with a configurable iteration cap.
 
-    Three outcomes:
+    Four outcomes:
     - ``"end"``           — tests passed and all phases are done
     - ``"advance_phase"`` — tests passed but more phases remain
-    - ``"reflect"``       — tests failed and we haven't hit the cap
+    - ``"reflect"``       — tests failed, text mode → full reflector
+    - ``"coder"``         — tests failed, tool-calling mode → skip reflector
     """
     def _should_continue(state: ScientificState) -> str:
         if not state.get("test_logs"):
@@ -58,6 +95,11 @@ def _make_should_continue(max_iters: int):
             return "end"
         if max_iters > 0 and state.get("iteration_count", 0) >= max_iters:
             return "end"
+        # In tool-calling mode, skip the reflector LLM call — route directly
+        # to the coder (or planner if stuck).  The lightweight _auto_reflect
+        # node handles error fingerprinting and replan detection.
+        if state.get("tool_calling"):
+            return "auto_reflect"
         return "reflect"
     return _should_continue
 
@@ -87,6 +129,7 @@ def build_graph(max_iterations: int = MAX_ITERATIONS) -> StateGraph:
     graph.add_node("coder", coder)
     graph.add_node("verifier", verifier)
     graph.add_node("reflector", reflector)
+    graph.add_node("auto_reflect", auto_reflect)
     graph.add_node("advance_phase", advance_phase)
 
     graph.set_entry_point("planner")
@@ -95,10 +138,20 @@ def build_graph(max_iterations: int = MAX_ITERATIONS) -> StateGraph:
     graph.add_conditional_edges(
         "verifier",
         _make_should_continue(max_iterations),
-        {"reflect": "reflector", "advance_phase": "advance_phase", "end": END},
+        {
+            "reflect": "reflector",
+            "auto_reflect": "auto_reflect",
+            "advance_phase": "advance_phase",
+            "end": END,
+        },
     )
     graph.add_conditional_edges(
         "reflector",
+        _after_reflector,
+        {"coder": "coder", "replan": "planner"},
+    )
+    graph.add_conditional_edges(
+        "auto_reflect",
         _after_reflector,
         {"coder": "coder", "replan": "planner"},
     )
@@ -257,10 +310,20 @@ def run(task: str | None, task_file: str | None, thread_id: str, db: str,
             os.environ["LANGCHAIN_PROJECT"] = "explorer"
         click.echo(f"🔍 LangSmith tracing → project: {os.environ['LANGCHAIN_PROJECT']}")
 
+    # Pre-flight: verify that key scientific packages can be imported.
+    # A broken numpy (e.g. Xcode system Python 3.9 with incompatible
+    # wheels) will cause every verifier run to fail at collection time.
+    _preflight_check_imports()
+
     configure_llm(
         provider=provider, model=model,
         base_url=base_url, temperature=temperature,
     )
+
+    # Detect tool-calling capability so the planner and coder can adapt
+    from orchestrator.nodes import supports_tool_calling
+    tool_calling = supports_tool_calling()
+
     # Generate a unique thread ID when none is supplied, so each run
     # starts with a clean slate and stale checkpoints never interfere.
     if thread_id is None:
@@ -319,6 +382,7 @@ def run(task: str | None, task_file: str | None, thread_id: str, db: str,
         # Override with CLI-supplied values
         input_state["output_dir"] = output_dir or input_state.get("output_dir", "")
         input_state["skills_context"] = skills_context or input_state.get("skills_context", "")
+        input_state["tool_calling"] = tool_calling
         if task:
             input_state["task_description"] = task
 
@@ -351,6 +415,7 @@ def run(task: str | None, task_file: str | None, thread_id: str, db: str,
             "skills_context": skills_context,
             "plan_phases": [],
             "current_phase": 0,
+            "tool_calling": tool_calling,
             "transcript": [],
         }
 
@@ -372,12 +437,20 @@ def run(task: str | None, task_file: str | None, thread_id: str, db: str,
 
     # Stream node-by-node for live reporting
     final_state: dict[str, Any] = dict(input_state)
+    # Fields with add-reducers in ScientificState need manual
+    # accumulation here because dict.update() would overwrite them
+    # with only the delta returned by each node.
+    _ADDITIVE_KEYS = ("_llm_calls", "transcript")
     try:
         for event in app.stream(input_state, config=config):
             for node_name, update in event.items():
                 report_node(node_name, update)
                 if chat_logger:
                     chat_logger.log_node(node_name, update)
+                for key in _ADDITIVE_KEYS:
+                    if key in update:
+                        prev = final_state.get(key) or []
+                        final_state[key] = prev + update.pop(key)
                 final_state.update(update)
     except Exception:
         logger.exception("Graph runner crashed — writing partial results")

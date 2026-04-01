@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time as _time
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from ._shared import (
     _format_code_listing,
     _invoke_llm,
     _load_prompt,
+    make_llm_call_record,
 )
 from ..state import ScientificState
 from ..transcript import make_entry
@@ -41,6 +43,8 @@ def _normalize_pytest_output(text: str) -> str:
 def _run_pytest(root: Path, extra_env: dict[str, str] | None = None) -> list[str]:
     """Run ``pytest`` inside *root* and return failure logs (empty on success)."""
     env = {**os.environ, **(extra_env or {})}
+    # Force non-interactive matplotlib backend so plt.show() never blocks.
+    env.setdefault("MPLBACKEND", "Agg")
     result = subprocess.run(  # noqa: S603
         [sys.executable, "-m", "pytest", str(root), "-v", "--tb=short"],
         capture_output=True,
@@ -155,6 +159,41 @@ def _ensure_importable(root: Path, code_drafts: dict[str, str]) -> None:
     )
 
 
+# Packages that must never be shadowed by coder-generated directories.
+# Includes both test infrastructure and common scientific-stack packages.
+_SHADOW_BLACKLIST = frozenset({
+    "pytest", "numpy", "scipy", "matplotlib", "click", "pip",
+    "setuptools", "pkg_resources", "importlib", "typing",
+})
+
+
+def _check_shadowed_packages(code_drafts: dict[str, str]) -> list[str]:
+    """Detect code-draft directories that shadow well-known packages.
+
+    If the coder generates ``pytest/__init__.py`` or ``numpy/foo.py``,
+    ``python -m pytest`` (or any import of that package) will find the
+    local directory instead of the installed package, causing cryptic
+    failures.
+
+    Returns a list of human-readable error strings (empty if all OK).
+    """
+    # Collect top-level directory names from the draft paths
+    top_dirs: set[str] = set()
+    for fpath in code_drafts:
+        parts = fpath.replace("\\", "/").split("/")
+        if len(parts) >= 2:  # noqa: PLR2004 — has a subdirectory
+            top_dirs.add(parts[0])
+
+    errors: list[str] = []
+    for dirname in sorted(top_dirs & _SHADOW_BLACKLIST):
+        errors.append(
+            f"CRITICAL: directory '{dirname}/' shadows the installed "
+            f"'{dirname}' package.  Rename or remove all files under "
+            f"'{dirname}/' — they will break imports and pytest execution."
+        )
+    return errors
+
+
 def _check_syntax(code_drafts: dict[str, str]) -> list[str]:
     """Check every ``.py`` draft for syntax errors using ``ast.parse``.
 
@@ -254,7 +293,7 @@ def _check_pyproject_toml(code_drafts: dict[str, str]) -> list[str]:
     return errors
 
 
-def _llm_triage(code_drafts: dict[str, str], llm: Any) -> list[str]:
+def _llm_triage(code_drafts: dict[str, str], llm: Any) -> tuple[list[str], dict | None]:
     """Use the LLM to review code drafts for structural issues before pytest.
 
     Replaces the deterministic ``_check_import_consistency``,
@@ -263,7 +302,7 @@ def _llm_triage(code_drafts: dict[str, str], llm: Any) -> list[str]:
     bugs (import mismatches, argument-count errors, return-unpacking
     mismatches, layout conflicts) plus issues the heuristics couldn't.
 
-    Returns a list of human-readable error strings (empty if LLM says OK).
+    Returns a tuple of (error_list, llm_call_record_or_None).
     """
     prompt = _load_prompt("EXPLORER_PROMPT_TRIAGE", "triage.md")
 
@@ -271,18 +310,30 @@ def _llm_triage(code_drafts: dict[str, str], llm: Any) -> list[str]:
     sections = _format_code_listing(code_drafts)
 
     if not sections:
-        return []
+        return [], None
 
     user_msg = "## Code files to review\n\n" + "\n\n".join(sections)
 
-    response = _invoke_llm(llm, [
+    messages = [
         SystemMessage(content=prompt),
         HumanMessage(content=user_msg),
-    ])
+    ]
+    t0 = _time.monotonic()
+    response = _invoke_llm(llm, messages)
+    duration = _time.monotonic() - t0
+
+    call_record = make_llm_call_record(
+        node="verifier",
+        messages=messages,
+        response=response,
+        duration_s=duration,
+        label="triage",
+    )
+
     text = response.content.strip()
 
     if text == "LGTM" or not text:
-        return []
+        return [], call_record
 
     # Parse bullet-point issues
     errors: list[str] = []
@@ -293,7 +344,7 @@ def _llm_triage(code_drafts: dict[str, str], llm: Any) -> list[str]:
         elif line and not line.startswith("#"):
             # Non-empty, non-header line — include as-is
             errors.append(line)
-    return errors
+    return errors, call_record
 
 
 def _warn_stale_files(
@@ -325,7 +376,7 @@ def verifier(state: ScientificState) -> dict[str, Any]:
     """
     code_drafts: dict[str, str] = state.get("code_drafts", {})
     if not code_drafts:
-        transcript = list(state.get("transcript") or [])
+        transcript: list[dict] = []
         transcript.append(make_entry(
             "human", "No code drafts to verify.",
             node="verifier",
@@ -340,15 +391,21 @@ def verifier(state: ScientificState) -> dict[str, Any]:
         }
 
     # Quick structural and import checks before running pytest
+    shadow_errors = _check_shadowed_packages(code_drafts)
     syntax_errors = _check_syntax(code_drafts)
-    pre_errors = _check_pyproject_toml(code_drafts)
+    pre_errors = shadow_errors + _check_pyproject_toml(code_drafts)
     pre_errors += syntax_errors
-    if not pre_errors:
+    llm_calls: list[dict] = []
+    if not pre_errors and not state.get("tool_calling"):
         # LLM triage replaces the old AST-based heuristics
         # (_check_duplicate_modules, _check_import_consistency,
         #  _check_cross_module_contracts).
+        # Skipped in tool-calling mode — the coder's inner tool loop
+        # already catches structural issues.
         llm = _shared.get_llm()
-        pre_errors = _llm_triage(code_drafts, llm)
+        pre_errors, triage_record = _llm_triage(code_drafts, llm)
+        if triage_record:
+            llm_calls.append(triage_record)
 
     # Track which files are clean (no syntax or import errors)
     files_with_errors: set[str] = set()
@@ -404,7 +461,7 @@ def verifier(state: ScientificState) -> dict[str, Any]:
         or "Interrupted: " in log_text and "error during collection" in log_text
     )
 
-    transcript = list(state.get("transcript") or [])
+    transcript: list[dict] = []
     if logs:
         transcript.append(make_entry(
             "human", f"Tests FAILED:\n```\n{log_text[:3000]}\n```",
@@ -431,4 +488,5 @@ def verifier(state: ScientificState) -> dict[str, Any]:
         "clean_files": clean_files,
         "code_drafts": code_drafts,
         "transcript": transcript,
+        "_llm_calls": llm_calls,
     }

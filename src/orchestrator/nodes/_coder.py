@@ -6,17 +6,21 @@ import ast
 import logging
 import subprocess
 import sys
+import tempfile
+import time as _time
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from . import _shared
 from ._shared import (
     _format_code_listing,
     _invoke_llm,
     _load_prompt,
+    make_llm_call_record,
 )
+from ._verifier import _check_shadowed_packages, _check_syntax, _prepare_sandbox, _run_pytest
 from ..state import ScientificState
 from ..transcript import format_history, make_entry
 
@@ -108,17 +112,51 @@ def _get_environment_info() -> str:
     return _env_info_cache
 
 
+# ---------------------------------------------------------------------------
+# Inner-loop quick verification
+# ---------------------------------------------------------------------------
+MAX_INNER_ITERATIONS = 3
+
+
+def _quick_verify(code_drafts: dict[str, str]) -> list[str]:
+    """Run syntax checks + pytest in a temp sandbox.
+
+    Returns a list of error strings (empty on success).
+    This is a lightweight version of the verifier — no LLM triage,
+    no stuck-loop detection, just fast feedback for the coder's inner loop.
+    """
+    if not code_drafts:
+        return []
+
+    shadow_errors = _check_shadowed_packages(code_drafts)
+    if shadow_errors:
+        return shadow_errors
+
+    syntax_errors = _check_syntax(code_drafts)
+    if syntax_errors:
+        return syntax_errors
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _prepare_sandbox(root, code_drafts)
+        return _run_pytest(root)
+
+
 def _append_coder_transcript(
     state: ScientificState,
     new_drafts: dict[str, str],
     deletions: set[str],
+    *,
+    inner_iterations: int = 0,
 ) -> list[dict]:
     """Build updated transcript with coder summary entry."""
-    transcript = list(state.get("transcript") or [])
+    transcript: list[dict] = []
     file_list = ", ".join(sorted(new_drafts.keys()))
     parts = [f"Generated {len(new_drafts)} file(s): {file_list}"]
     if deletions:
         parts.append(f"Deleted: {', '.join(sorted(deletions))}")
+    if inner_iterations > 0:
+        parts.append(f"Inner-loop self-corrections: {inner_iterations}")
     transcript.append(make_entry(
         "ai", "\n".join(parts),
         node="coder",
@@ -128,8 +166,209 @@ def _append_coder_transcript(
     return transcript
 
 
+_DELETE_MARKER = "# DELETE"
+
+
+def _split_deletions(drafts: dict[str, str]) -> tuple[dict[str, str], set[str]]:
+    """Separate deletion markers from real code blocks.
+
+    Returns ``(clean_drafts, deletions)`` where *clean_drafts* has
+    deletion entries removed and *deletions* is the set of paths to delete.
+    """
+    deletions: set[str] = set()
+    clean: dict[str, str] = {}
+    for fp, content in drafts.items():
+        if content.strip() == _DELETE_MARKER:
+            deletions.add(fp)
+        else:
+            clean[fp] = content
+    return clean, deletions
+
+
+def _merge_and_clean(
+    new_drafts: dict[str, str],
+    existing_drafts: dict[str, str],
+    deletions: set[str],
+) -> dict[str, str]:
+    """Merge new drafts into existing, apply deletions and layout resolution."""
+    merged = dict(existing_drafts)
+    merged.update(new_drafts)
+    for fp in deletions:
+        merged.pop(fp, None)
+    _resolve_duplicate_layouts(merged, new_drafts)
+    return merged
+
+
+def _finalize_output(
+    state: ScientificState,
+    raw_content: str,
+    new_drafts: dict[str, str],
+    existing_drafts: dict[str, str],
+    deletions: set[str],
+    inner_iterations: int,
+    user_message: str,
+    *,
+    merged_drafts: dict[str, str] | None = None,
+    llm_calls: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Build the coder node's return dict.
+
+    Handles disk persistence (write mode) and builds the transcript entry.
+    If *merged_drafts* is not provided, computes it from the parts.
+    """
+    if merged_drafts is None:
+        merged_drafts = _merge_and_clean(new_drafts, existing_drafts, deletions)
+
+    output_dir = state.get("output_dir", "")
+    if output_dir:
+        _write_code_drafts(new_drafts, output_dir)
+        root = Path(output_dir).resolve()
+        all_removed = deletions | (
+            (set(existing_drafts) | set(new_drafts)) - set(merged_drafts)
+        )
+        for fp in all_removed:
+            target = (root / fp).resolve()
+            if target.is_relative_to(root) and target.exists():
+                logger.warning("Removing file from disk: %s", fp)
+                target.unlink()
+
+    return {
+        "code_drafts": merged_drafts,
+        "coder_raw_response": raw_content,
+        "_prompt_summary": user_message,
+        "_inner_loop_count": inner_iterations,
+        "transcript": _append_coder_transcript(
+            state, new_drafts, deletions,
+            inner_iterations=inner_iterations,
+        ),
+        "_llm_calls": llm_calls or [],
+    }
+
+
+def _tool_calling_coder(
+    state: ScientificState,
+    llm: Any,
+    prompt: str,
+    user_message: str,
+    existing_drafts: dict[str, str],
+) -> dict[str, Any]:
+    """Run the coder as a tool-calling ReAct agent.
+
+    Creates a sandbox seeded with *existing_drafts*, binds tools to the
+    LLM, and runs a write-test-fix loop.  Falls back to text parsing if
+    the LLM doesn't emit tool calls on the first turn.
+    """
+    from ._tools import CoderSandbox, make_sandbox_tools, MAX_TOOL_ROUNDS
+    from langchain_core.messages import ToolMessage
+
+    sandbox = CoderSandbox(existing_drafts if existing_drafts else None)
+    try:
+        tools = make_sandbox_tools(sandbox)
+        tool_map = {t.name: t for t in tools}
+        llm_with_tools = llm.bind_tools(tools)
+
+        messages: list = [
+            SystemMessage(content=prompt),
+            HumanMessage(content=user_message),
+        ]
+
+        tool_rounds = 0
+        raw_content = ""
+        llm_calls: list[dict] = []
+
+        try:
+            for round_num in range(MAX_TOOL_ROUNDS):
+                t0 = _time.monotonic()
+                response = _invoke_llm(llm_with_tools, messages)
+                duration = _time.monotonic() - t0
+                messages.append(response)
+                raw_content = response.content or ""
+
+                # Collect tool-call results for this round
+                round_tool_msgs: list[dict] = []
+
+                if not getattr(response, "tool_calls", None):
+                    llm_calls.append(make_llm_call_record(
+                        node="coder",
+                        messages=messages[:-1],  # exclude the response we just appended
+                        response=response,
+                        duration_s=duration,
+                        label=f"tool-round-{round_num}" if round_num > 0 else "tool-round-0 (text-only fallback)" if round_num == 0 else "",
+                    ))
+                    if round_num == 0:
+                        # LLM ignored tools — fall back to text parsing
+                        logger.info(
+                            "Tool-calling LLM returned text only; "
+                            "falling back to text parsing"
+                        )
+                        new_drafts = _parse_code_blocks(raw_content)
+                        new_drafts, deletions = _split_deletions(new_drafts)
+                        return _finalize_output(
+                            state, raw_content, new_drafts, existing_drafts,
+                            deletions, 0, user_message,
+                            llm_calls=llm_calls,
+                        )
+                    break  # LLM finished after using tools
+
+                for tc in response.tool_calls:
+                    name = tc["name"]
+                    args = tc["args"]
+                    tid = tc["id"]
+                    if name in tool_map:
+                        try:
+                            result = tool_map[name].invoke(args)
+                        except Exception as exc:
+                            result = f"Error: {exc}"
+                    else:
+                        result = f"Error: unknown tool '{name}'"
+                    messages.append(ToolMessage(content=str(result), tool_call_id=tid))
+                    round_tool_msgs.append({
+                        "tool": name,
+                        "args": args,
+                        "result": str(result)[:2000],
+                    })
+
+                llm_calls.append(make_llm_call_record(
+                    node="coder",
+                    messages=messages[:round_num + 2],  # sys + human + prior rounds
+                    response=response,
+                    duration_s=duration,
+                    tool_messages=round_tool_msgs,
+                    label=f"tool-round-{round_num}",
+                ))
+                tool_rounds += 1
+        except Exception as inner_exc:
+            # Attach partial call records so the fallback path can
+            # include them in its output.
+            inner_exc.partial_llm_calls = llm_calls  # type: ignore[attr-defined]
+            raise
+
+        # Collect final state from sandbox
+        final_drafts = sandbox.collect_drafts()
+        new_drafts = {
+            k: v for k, v in final_drafts.items()
+            if k not in existing_drafts or existing_drafts[k] != v
+        }
+        deletions = set(existing_drafts) - set(final_drafts)
+
+        return _finalize_output(
+            state, raw_content, new_drafts, existing_drafts,
+            deletions, tool_rounds, user_message,
+            merged_drafts=dict(final_drafts),
+            llm_calls=llm_calls,
+        )
+    finally:
+        sandbox.cleanup()
+
+
 def coder(state: ScientificState) -> dict[str, Any]:
     """Generate Python source code from the current plan phase.
+
+    Includes an **inner self-correction loop**: after generating code the
+    node runs a quick syntax-check + pytest in a sandbox.  If tests fail,
+    the error output is fed back to the LLM for up to
+    ``MAX_INNER_ITERATIONS - 1`` additional attempts before returning to
+    the outer graph loop.
 
     Returns
     -------
@@ -202,69 +441,102 @@ def coder(state: ScientificState) -> dict[str, Any]:
         user_parts.append(state["skills_context"])
 
     user_message = "\n\n".join(user_parts)
-    response = _invoke_llm(llm, [
+
+    # ── Tool-calling dispatch ───────────────────────────────────────────
+    _fallback_llm_calls: list[dict] = []
+    if _shared.supports_tool_calling(llm):
+        tool_prompt = _load_prompt(
+            "EXPLORER_PROMPT_CODER_TOOLS", "coder_tools.md",
+        )
+        try:
+            return _tool_calling_coder(
+                state, llm, tool_prompt, user_message, existing_drafts,
+            )
+        except Exception as exc:
+            # Ollama (and some other providers) fail to parse tool-call JSON
+            # when the code contains special characters.  Fall back to text
+            # mode rather than crashing the entire run.
+            err_str = str(exc).lower()
+            if "error parsing tool call" in err_str or "tool_call" in err_str:
+                logger.warning(
+                    "Tool-calling failed (%s); falling back to text mode",
+                    exc,
+                )
+                # Preserve any LLM calls recorded before the crash
+                _fallback_llm_calls = getattr(exc, "partial_llm_calls", [])
+            else:
+                raise
+
+    # ── Text-mode inner self-correction loop ────────────────────────────
+    messages: list = [
         SystemMessage(content=prompt),
         HumanMessage(content=user_message),
-    ])
+    ]
+    inner_iterations = 0
+    llm_calls: list[dict] = list(_fallback_llm_calls)
 
-    raw_content = response.content
-    new_drafts = _parse_code_blocks(raw_content)
+    for inner_attempt in range(MAX_INNER_ITERATIONS):
+        t0 = _time.monotonic()
+        response = _invoke_llm(llm, messages)
+        duration = _time.monotonic() - t0
+        raw_content = response.content
 
-    # Handle explicit deletion markers: if coder emits "# DELETE" as the
-    # sole content of a code block, it signals that file should be removed.
-    _DELETE_MARKER = "# DELETE"
-    deletions: set[str] = set()
-    for fp, content in list(new_drafts.items()):
-        if content.strip() == _DELETE_MARKER:
-            deletions.add(fp)
-            del new_drafts[fp]
+        llm_calls.append(make_llm_call_record(
+            node="coder",
+            messages=messages,
+            response=response,
+            duration_s=duration,
+            label=f"inner-loop-{inner_attempt}" if inner_attempt > 0 else "initial",
+        ))
 
-    # On revision iterations, protect files that are verified clean ONLY
-    # after the coder has already had one chance to fix (iteration >= 2).
-    # Both test files and source files use the same criterion: only protect
-    # files present in clean_files (all tests passing, no errors).
-    # This ensures test files with bugs (e.g. wrong subprocess invocation)
-    # can still be fixed while truly passing test files remain untouched.
-    phase_iter = state.get("_phase_iteration_count", 0)
-    if is_revision and existing_drafts and phase_iter >= 2:
-        clean = set(state.get("clean_files") or [])
-        protected = {fp for fp in clean if fp in existing_drafts}
-        for fp in protected:
-            new_drafts.pop(fp, None)
+        new_drafts = _parse_code_blocks(raw_content)
+        new_drafts, deletions = _split_deletions(new_drafts)
 
-    # Merge new drafts into accumulated drafts (new files override old)
-    merged_drafts = dict(existing_drafts)
-    merged_drafts.update(new_drafts)
+        # On revision iterations, protect files verified clean by the
+        # outer verifier.  Applied on every inner-loop iteration because
+        # the clean-file list reflects the outer graph state.
+        phase_iter = state.get("_phase_iteration_count", 0)
+        if is_revision and existing_drafts and phase_iter >= 2:
+            clean = set(state.get("clean_files") or [])
+            protected = {fp for fp in clean if fp in existing_drafts}
+            for fp in protected:
+                new_drafts.pop(fp, None)
 
-    # Apply explicit deletions
-    for fp in deletions:
-        merged_drafts.pop(fp, None)
+        merged_drafts = _merge_and_clean(new_drafts, existing_drafts, deletions)
 
-    # Auto-resolve duplicate layouts (flat vs src/).
-    # If both exist, keep whichever layout the new_drafts prefer.
-    _resolve_duplicate_layouts(merged_drafts, new_drafts)
+        # Quick verify — skip on the last attempt (let outer verifier handle it)
+        if inner_attempt < MAX_INNER_ITERATIONS - 1 and merged_drafts:
+            errors = _quick_verify(merged_drafts)
+            if not errors:
+                break  # Tests pass — done
+            # Feed errors back to the LLM for self-correction
+            inner_iterations += 1
+            error_text = "\n".join(errors)
+            logger.info(
+                "Inner-loop attempt %d/%d failed, feeding errors back to LLM",
+                inner_attempt + 1, MAX_INNER_ITERATIONS,
+            )
+            # Build context for the fix: show the LLM its own output + errors
+            messages.append(AIMessage(content=raw_content))
+            messages.append(HumanMessage(
+                content=(
+                    f"## Test errors (inner-loop attempt {inner_attempt + 1})\n"
+                    f"Your code has errors. Fix them and regenerate ALL files.\n\n"
+                    f"```\n{error_text[:3000]}\n```"
+                ),
+            ))
+            # Update existing_drafts so the next merge is correct
+            existing_drafts = merged_drafts
+        else:
+            break
 
-    # In write mode, persist files and clean up deleted/pruned files
-    output_dir = state.get("output_dir", "")
-    if output_dir:
-        _write_code_drafts(new_drafts, output_dir)
-        # Remove any files that were deleted or pruned from disk
-        root = Path(output_dir).resolve()
-        all_removed = deletions | (
-            (set(existing_drafts) | set(new_drafts)) - set(merged_drafts)
-        )
-        for fp in all_removed:
-            target = (root / fp).resolve()
-            if target.is_relative_to(root) and target.exists():
-                logger.warning("Removing file from disk: %s", fp)
-                target.unlink()
-
-    return {
-        "code_drafts": merged_drafts,
-        "coder_raw_response": raw_content,
-        "_prompt_summary": user_message,
-        "transcript": _append_coder_transcript(state, new_drafts, deletions),
-    }
+    # ── Post-loop: persist and return ───────────────────────────────────
+    return _finalize_output(
+        state, raw_content, new_drafts, existing_drafts,
+        deletions, inner_iterations, user_message,
+        merged_drafts=merged_drafts,
+        llm_calls=llm_calls,
+    )
 
 
 _FILE_EXTENSIONS = frozenset({

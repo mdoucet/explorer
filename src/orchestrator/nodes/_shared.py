@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +107,9 @@ def _invoke_llm(llm: Any, messages: list, *, max_retries: int = 3, retry_delay: 
             return result
         except Exception as exc:
             err_str = str(exc).lower()
+            # Tool-call parsing errors are deterministic — retrying won't help
+            if "error parsing tool call" in err_str:
+                raise
             transient = any(k in err_str for k in (
                 "incomplete chunked read", "peer closed", "connection",
                 "timeout", "502", "503", "504", "remotedisconnected",
@@ -119,6 +124,90 @@ def _invoke_llm(llm: Any, messages: list, *, max_retries: int = 3, retry_delay: 
                 time.sleep(retry_delay)
                 continue
             raise
+
+
+def make_llm_call_record(
+    *,
+    node: str,
+    messages: list,
+    response: Any,
+    duration_s: float,
+    tool_messages: list | None = None,
+    label: str = "",
+) -> dict[str, Any]:
+    """Build a structured record of a single LLM API call.
+
+    Parameters
+    ----------
+    node : str
+        Name of the graph node that made the call.
+    messages : list
+        The message list sent to the LLM (system + human messages).
+    response : Any
+        The LangChain response object (AIMessage).
+    duration_s : float
+        Wall-clock time for the call in seconds.
+    tool_messages : list or None
+        Optional list of tool-call round-trip dicts for tool-calling mode.
+    label : str
+        Optional human-readable label (e.g. "triage", "inner-loop attempt 2").
+    """
+    # Extract system and user prompts from message list
+    system_prompt = ""
+    user_prompt = ""
+    for msg in messages:
+        if hasattr(msg, "type"):
+            if msg.type == "system":
+                system_prompt = msg.content
+            elif msg.type == "human":
+                user_prompt = msg.content
+        elif isinstance(msg, dict):
+            if msg.get("role") == "system":
+                system_prompt = msg.get("content", "")
+            elif msg.get("role") == "human" or msg.get("role") == "user":
+                user_prompt = msg.get("content", "")
+
+    response_text = ""
+    thinking_text = ""
+    tool_calls_out: list[dict] = []
+    if response is not None:
+        response_text = getattr(response, "content", "") or ""
+        raw_tc = getattr(response, "tool_calls", None) or []
+        tool_calls_out = [
+            {"name": tc.get("name", ""), "args": tc.get("args", {})}
+            for tc in raw_tc
+        ]
+        # Extract thinking/reasoning content (Ollama reasoning mode,
+        # DeepSeek-R1, etc.) from additional_kwargs.
+        extra = getattr(response, "additional_kwargs", None)
+        if isinstance(extra, dict):
+            thinking_text = extra.get("reasoning_content", "") or ""
+
+    # Token usage if the LLM provides it
+    usage: dict[str, int] = {}
+    resp_meta = getattr(response, "response_metadata", None) or {}
+    if "token_usage" in resp_meta:
+        usage = resp_meta["token_usage"]
+    elif "usage" in resp_meta:
+        usage = resp_meta["usage"]
+    # Ollama sometimes nests under usage_metadata
+    usage_meta = getattr(response, "usage_metadata", None) or {}
+    if not usage and usage_meta:
+        usage = dict(usage_meta)
+
+    return {
+        "node": node,
+        "label": label,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "duration_s": round(duration_s, 2),
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+        "response_text": response_text,
+        "thinking": thinking_text,
+        "tool_calls": tool_calls_out,
+        "tool_messages": tool_messages or [],
+        "token_usage": usage,
+    }
 
 
 def _format_code_listing(
@@ -156,3 +245,36 @@ def _format_code_listing(
         else:
             sections.append(f"### {fpath}\n```python\n{source}\n```")
     return sections
+
+
+def supports_tool_calling(llm: Any = None) -> bool:
+    """Check if the current LLM supports tool calling.
+
+    Returns ``False`` when:
+    - ``EXPLORER_NO_TOOL_CALLING`` environment variable is truthy
+    - The LLM doesn't have a ``bind_tools`` method
+    - ``bind_tools`` raises an exception for a probe tool
+    """
+    if os.environ.get("EXPLORER_NO_TOOL_CALLING", "").lower() in (
+        "1", "true", "yes",
+    ):
+        return False
+
+    if llm is None:
+        llm = get_llm()
+
+    if not hasattr(llm, "bind_tools"):
+        return False
+
+    try:
+        from langchain_core.tools import tool as _tool
+
+        @_tool
+        def _probe() -> str:
+            """Probe tool for capability detection."""
+            return ""
+
+        llm.bind_tools([_probe])
+        return True
+    except Exception:
+        return False
